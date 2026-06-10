@@ -1,0 +1,4 @@
+[console_scripts]
+outlier-detect = outlierdetect.cli:main
+outlierdetect-predict = outlierdetect.cli:predict_main
+outlierdetect-train = outlierdetect.cli:train_main

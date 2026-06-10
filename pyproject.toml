@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "outlierdetect"
+version = "0.1.0"
+description = "MVP package for local QC, outlier detection, and optional stable reconstruction of sparse CTD-SRDL profiles."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Anatole Gros-Martial"},
+  {name = "Fabien Roquet"},
+]
+keywords = ["oceanography", "MEOP", "CTD-SRDL", "quality-control", "neural-network"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dependencies = [
+  "numpy>=1.24",
+  "pyarrow>=15",
+  "gsw>=3.6",
+]
+
+[project.optional-dependencies]
+io = [
+  "pandas>=2.0",
+  "xarray>=2024.1",
+  "netCDF4>=1.6",
+  "scipy>=1.11",
+]
+train = [
+  "matplotlib>=3.8",
+  "torch>=2.1",
+  "tqdm>=4.66",
+]
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.4",
+]
+all = [
+  "matplotlib>=3.8",
+  "pandas>=2.0",
+  "xarray>=2024.1",
+  "netCDF4>=1.6",
+  "scipy>=1.11",
+  "torch>=2.1",
+  "tqdm>=4.66",
+  "pytest>=7.4",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+outlier-detect = "outlierdetect.cli:main"
+outlierdetect-predict = "outlierdetect.cli:predict_main"
+outlierdetect-train = "outlierdetect.cli:train_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,146 @@
+# OutlierDetect
+
+`outlierdetect` is a Python package for local CTD-SRDL-style profile quality control, outlier detection, and optional stable reconstruction.
+
+## Install
+
+```bash
+pip install -e .
+```
+
+For training, prediction, and Argo NetCDF support:
+
+```bash
+pip install -e ".[train,io]"
+```
+
+The `io` extra includes `pandas`, `xarray`, `netCDF4`, and `scipy` for parquet-backed datasets and NetCDF I/O. `pyarrow` and `gsw` are core dependencies.
+The `train` extra includes PyTorch, matplotlib, and tqdm for checkpoints and training progress.
+
+## Inference
+
+```python
+import numpy as np
+
+from outlierdetect import Heuristic, ProfileInput
+
+profile = ProfileInput(
+    pressure=np.array([5, 20, 45, 80, 130, 210, 330, 500], dtype=float),
+    temperature=np.array([5.6, 5.4, 5.1, 4.8, 4.4, 3.8, 3.0, 2.3]),
+    salinity=np.array([34.10, 34.12, 34.15, 34.20, 34.28, 34.40, 34.56, 34.70]),
+    residual_t=np.array([0.12, 0.10, 0.11, 0.09, 0.12, 0.08, 0.10, 0.09]),
+    residual_s=np.array([0.08, 0.08, 0.09, 0.08, 0.09, 0.08, 0.09, 0.08]),
+    sigma_t=np.full(8, 0.25),
+    sigma_s=np.full(8, 0.04),
+    sigma_vert=np.full(8, 40.0),
+    day_of_year=220,
+    profile_id="example_profile",
+)
+
+result = Heuristic().predict(profile)
+print(result.summary())
+```
+
+You can also run a trained model on new data:
+
+```bash
+outlier-detect --predict --argo-root C:\data\argo --checkpoint checkpoints\profile_qc.pt
+```
+
+To save the same prediction workflow through the dedicated script, use:
+
+```bash
+outlierdetect-predict --argo-root C:\data\argo --checkpoint checkpoints\profile_qc.pt
+```
+
+By default, prediction keeps all finite, non-negative levels and ignores Argo QC flags. Add `--good-qc-only` if you want NetCDF inputs masked by `PRES_QC`, `TEMP_ADJUSTED_QC`, and `PSAL_ADJUSTED_QC`.
+
+## Training
+
+Training starts from clean Argo profile files and builds synthetic training examples by:
+
+1. reading `PRES`, `TEMP_ADJUSTED`, and `PSAL_ADJUSTED`,
+2. keeping each profile on its own native pressure vector,
+3. subsampling that profile independently,
+4. adding realistic noise, coherent bias, spikes, and other degradations,
+5. training the neural model on the resulting labeled examples.
+
+Launch training with:
+
+```bash
+outlierdetect-train --argo-root C:\data\argo --output checkpoints\profile_qc.pt
+```
+
+Useful options:
+
+```bash
+outlierdetect-train --argo-root C:\data\argo --epochs 10 --batch-size 16 --n-levels 20 --n-examples-per-profile 2
+```
+
+`--n-levels` controls the target sparse sampling density per profile. It is applied separately to each source profile, so profiles with different native depth sampling remain distinct.
+
+During training, a run directory is created under `src/outlierdetect/train/data/run/<run_id>/`. The file `progress.json` is rewritten after every epoch, and 10 random T-S reconstruction plots with density contours are saved under `plots/epoch_XXX/`.
+
+Each saved plot has a matching `*.json` sidecar in the same epoch directory with `profile_bad_probability`, `point_bad_t`, `point_bad_s`, and `point_density_inconsistent` for that inspected profile.
+
+The predict CLI writes the same per-profile JSON payloads under `predictions/` and one plot per predicted profile under `plots/predict/`.
+
+You can override the training artifact root and epoch plot count:
+
+```bash
+outlierdetect-train --argo-root C:\data\argo --run-root C:\tmp\outlierdetect-runs --epoch-plot-count 10
+```
+
+The same command also accepts a parquet file exported by `outlier-detect --raw-to-parquet`:
+
+```bash
+outlierdetect-train --argo-root C:\data\argo.parquet --output checkpoints\profile_qc.pt
+```
+
+## Raw To Parquet
+
+To recursively walk a directory, load every `.nc` file under it, and write one parquet file with one row per observed level:
+
+```bash
+outlier-detect --raw-to-parquet --input C:\data\argo --output C:\data\argo.parquet
+```
+
+You can also point `--input` at a single `.nc` file, and you can override the recursive glob with `--pattern`.
+`--output` must be a parquet file path, not an existing directory.
+
+The parquet file stores one row per observed level with these columns:
+
+- `source_file`
+- `profile_index_in_file`
+- `profile_id`
+- `float_wmo`
+- `cycle_number`
+- `juld`
+- `n_levels`
+- `level_index`
+- `pressure`
+- `temperature`
+- `salinity`
+
+The file does not store Argo QC flags. If you export with the default `--good-qc-only`, the rows are already filtered before writing. If you export with `--no-good-qc-only`, the raw adjusted values are written as-is. The summary counts (`n_files`, `n_profiles`, `n_rows`) are printed as JSON by the CLI, not stored as parquet columns.
+
+When you train from a parquet file, those stored level values are used directly to reconstruct each profile. QC flags are not reapplied because they are not stored in the parquet.
+
+## Model API
+
+```python
+from outlierdetect import Net, NetConfig
+from outlierdetect.training import build_argo_dataset, fit_model
+```
+
+The training helpers expose:
+
+```python
+from outlierdetect.training import ProfileDataset, ProfileExample, ProfileLabels, collate_profiles
+```
+
+## Notes
+
+- The model uses residuals and local uncertainty scales when available.
+- The reconstruction grid is a separate target grid and does not replace each profile's native observed depths.
+- Checkpoints store the model state plus metadata such as input dimension, grid size, and feature names.
