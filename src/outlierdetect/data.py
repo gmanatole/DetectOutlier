@@ -312,7 +312,7 @@ class NuisanceBias:
     b_t: float = np.nan
     a_s: float = np.nan
     b_s: float = np.nan
-    uncertainty: dict[str, float] = field(default_factory=dict)
+    uncertainty: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -327,6 +327,7 @@ class Result:
     point_bad_s: FloatArray
     point_density_inconsistent: FloatArray
     nuisance_bias: NuisanceBias
+    correction_posterior: Any | None = None
     pressure_grid: FloatArray | None = None
     temperature_reconstructed: FloatArray | None = None
     salinity_reconstructed: FloatArray | None = None
@@ -343,6 +344,8 @@ class Result:
             if isinstance(value, np.ndarray):
                 return value.tolist()
             if isinstance(value, NuisanceBias):
+                return value.as_dict()
+            if hasattr(value, "as_dict") and callable(value.as_dict):
                 return value.as_dict()
             if isinstance(value, dict):
                 return {k: conv(v) for k, v in value.items()}
@@ -368,6 +371,15 @@ class Result:
             "b_t_local": float(self.nuisance_bias.b_t),
             "a_s_local": float(self.nuisance_bias.a_s),
             "b_s_local": float(self.nuisance_bias.b_s),
+            "correction_status": None
+            if self.correction_posterior is None
+            else getattr(self.correction_posterior, "status", None),
+            "correction_prior_tension": None
+            if self.correction_posterior is None
+            else float(getattr(self.correction_posterior, "prior_tension", np.nan)),
+            "correction_information_gain": None
+            if self.correction_posterior is None
+            else float(getattr(self.correction_posterior, "information_gain", np.nan)),
         }
 
     def probability_dict(self) -> dict[str, Any]:

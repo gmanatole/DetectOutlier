@@ -1,10 +1,15 @@
-"""Lightweight density and stability diagnostics.
+"""TEOS-10/GSW-backed density and stability diagnostics.
 
-This MVP keeps a simple proxy for feature engineering and stability heuristics,
-but plotting helpers can also request GSW-backed sigma0 contours.
+The historical ``density_proxy`` name is preserved for compatibility, but the
+implementation now uses the GSW equation of state instead of the old linear
+T/S proxy. Static stability is assessed with sigma0, which keeps the logic
+physical while remaining practical for sparse CTD profiles.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -12,18 +17,29 @@ from numpy.typing import ArrayLike, NDArray
 FloatArray = NDArray[np.float64]
 
 
-def density_proxy(temperature: ArrayLike, salinity: ArrayLike) -> FloatArray:
-    """Return a simple potential-density anomaly proxy.
+def profile_location_from_attrs(attrs: Mapping[str, Any] | None) -> tuple[float, float]:
+    """Extract longitude/latitude metadata with safe fallbacks."""
+    if attrs is None:
+        return 0.0, 0.0
+    lon = _coerce_optional_float(_lookup_attr(attrs, ("longitude", "lon", "LONGITUDE", "LON")))
+    lat = _coerce_optional_float(_lookup_attr(attrs, ("latitude", "lat", "LATITUDE", "LAT")))
+    return 0.0 if lon is None else lon, 0.0 if lat is None else lat
 
-    The scale is approximately kg m-3, but only relative differences should be
-    interpreted. The sign convention is correct: density increases with salinity
-    and decreases with temperature.
+
+def density_proxy(
+    temperature: ArrayLike,
+    salinity: ArrayLike,
+    pressure: ArrayLike | None = None,
+    *,
+    lon: float = 0.0,
+    lat: float = 0.0,
+) -> FloatArray:
+    """Return TEOS-10 sigma0 for a profile.
+
+    The name is kept for API compatibility. The result is no longer a linear
+    approximation.
     """
-    temp = np.asarray(temperature, dtype=float)
-    sal = np.asarray(salinity, dtype=float)
-    alpha = 0.20  # kg m-3 degC-1, rough thermal expansion effect
-    beta = 0.78  # kg m-3 psu-1, rough haline contraction effect
-    return -alpha * (temp - 10.0) + beta * (sal - 35.0)
+    return _sigma0_from_profile(pressure, temperature, salinity, lon=lon, lat=lat)
 
 
 def sigma0_from_ts(
@@ -33,27 +49,17 @@ def sigma0_from_ts(
     lon: float = 0.0,
     lat: float = 0.0,
 ) -> FloatArray:
-    """Compute sigma0 contours from T/S using the GSW package.
+    """Compute sigma0 contours from T/S using GSW.
 
-    This is intended for T-S plots. The plot code does not carry station
-    coordinates, so the lon/lat defaults are a pragmatic approximation.
+    This is intended for T-S plots. Plot code does not always carry station
+    coordinates, so lon/lat default to zero as a pragmatic fallback.
     """
-    try:
-        import gsw  # noqa: PLC0415
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise ImportError(
-            "GSW is required for density contours. Install with: pip install gsw "
-            "or pip install -e '.[train]'."
-        ) from exc
-
     sp, temp = np.broadcast_arrays(
         np.asarray(salinity, dtype=float),
         np.asarray(temperature, dtype=float),
     )
     pressure = np.zeros_like(sp, dtype=float)
-    sa = gsw.SA_from_SP(sp, pressure, lon, lat)
-    ct = gsw.CT_from_t(sa, temp, pressure)
-    return np.asarray(gsw.sigma0(sa, ct), dtype=float)
+    return _sigma0_from_profile(pressure, temp, sp, lon=lon, lat=lat)
 
 
 def inversion_metrics(
@@ -61,24 +67,28 @@ def inversion_metrics(
     temperature: ArrayLike,
     salinity: ArrayLike,
     tolerance: float = 1e-4,
+    *,
+    lon: float = 0.0,
+    lat: float = 0.0,
 ) -> dict[str, FloatArray | float]:
-    """Compute simple density-inversion diagnostics for a sparse profile.
+    """Compute density-inversion diagnostics for a sparse profile.
 
     Returns
     -------
     dict
-        ``density_proxy``: proxy density at levels.
+        ``density_proxy`` and ``density_sigma0``: sigma0 at levels.
         ``drho_dp``: finite-difference density gradient between levels.
-        ``level_inversion_magnitude``: per-level positive magnitude where density
-        decreases with pressure.
+        ``level_inversion_magnitude``: per-level positive magnitude where
+        density decreases with pressure.
         ``max_inversion``: maximum pairwise inversion magnitude.
     """
     p = np.asarray(pressure, dtype=float)
-    rho = density_proxy(temperature, salinity)
+    rho = density_proxy(temperature, salinity, p, lon=lon, lat=lat)
     n = p.size
     if n < 2:
         return {
             "density_proxy": rho,
+            "density_sigma0": rho,
             "drho_dp": np.full(0, np.nan),
             "level_inversion_magnitude": np.full(n, np.nan),
             "max_inversion": np.nan,
@@ -98,6 +108,7 @@ def inversion_metrics(
     max_inv = float(np.nanmax(level_mag)) if np.any(np.isfinite(level_mag)) else np.nan
     return {
         "density_proxy": rho,
+        "density_sigma0": rho,
         "drho_dp": drho_dp,
         "level_inversion_magnitude": level_mag,
         "max_inversion": max_inv,
@@ -109,13 +120,15 @@ def stable_project_salinity_only(
     temperature: ArrayLike,
     salinity: ArrayLike,
     min_density_step: float = 1e-5,
+    *,
+    lon: float = 0.0,
+    lat: float = 0.0,
 ) -> tuple[FloatArray, FloatArray]:
-    """MVP static-stability projection by minimally increasing salinity.
+    """Project a profile onto a statically stable sigma0 sequence.
 
-    This is a crude placeholder. It keeps temperature fixed, computes a monotone
-    density proxy using a pool-adjacent-violators algorithm, then adjusts salinity
-    to match that monotone proxy. Production use should replace this with a
-    TEOS-10-aware constrained optimization over both T and S.
+    The temperature profile is left fixed. Salinity is increased just enough to
+    make the sigma0 profile non-decreasing with pressure, using a local TEOS-10
+    sensitivity estimate at each level.
     """
     p = np.asarray(pressure, dtype=float)
     t = np.asarray(temperature, dtype=float).copy()
@@ -125,19 +138,143 @@ def stable_project_salinity_only(
     if p.size < 2:
         return t, s
 
-    # Sort internally for projection and restore original order.
     order = np.argsort(p)
     inv_order = np.argsort(order)
-    rho = density_proxy(t[order], s[order])
+    p_sorted = _strictly_increasing_pressure(p[order])
+    t_sorted = _fill_missing_profile_values(t[order], p_sorted)
+    s_sorted = _fill_missing_profile_values(s[order], p_sorted)
 
-    rho_mono = _pava_non_decreasing(rho)
-    rho_mono = np.maximum.accumulate(rho_mono + min_density_step * np.arange(rho_mono.size))
+    try:
+        import gsw  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - dependency should be present
+        raise ImportError(
+            "GSW is required for density projection. Install with: pip install gsw "
+            "or pip install -e '.[train]'."
+        ) from exc
 
-    beta = 0.78
-    # rho = -alpha*(T-10)+beta*(S-35); only salinity is adjusted here.
-    delta_s = np.maximum((rho_mono - rho) / beta, 0.0)
-    s_sorted = s[order] + delta_s
-    return t, s_sorted[inv_order]
+    for _ in range(2):
+        sa = np.asarray(gsw.SA_from_SP(s_sorted, p_sorted, lon, lat), dtype=float)
+        ct = np.asarray(gsw.CT_from_t(sa, t_sorted, p_sorted), dtype=float)
+        sigma0 = np.asarray(gsw.sigma0(sa, ct), dtype=float)
+        rho, _, beta = gsw.rho_alpha_beta(sa, ct, p_sorted)
+        rho = np.asarray(rho, dtype=float)
+        beta = np.asarray(beta, dtype=float)
+
+        sigma0_mono = _pava_non_decreasing(sigma0)
+        sigma0_mono = np.maximum.accumulate(
+            sigma0_mono + min_density_step * np.arange(sigma0_mono.size, dtype=float)
+        )
+
+        drho_dsa = rho * beta
+        finite = np.isfinite(drho_dsa) & (drho_dsa > 0)
+        fallback = float(np.nanmedian(drho_dsa[finite])) if np.any(finite) else 0.75
+        drho_dsa = np.where(finite, drho_dsa, fallback)
+
+        delta_sa = np.maximum((sigma0_mono - sigma0) / np.maximum(drho_dsa, 1e-12), 0.0)
+        sa_projected = sa + delta_sa
+        s_next = np.asarray(gsw.SP_from_SA(sa_projected, p_sorted, lon, lat), dtype=float)
+        if np.allclose(s_next, s_sorted, rtol=1e-6, atol=1e-8, equal_nan=True):
+            s_sorted = s_next
+            break
+        s_sorted = s_next
+
+    return t[inv_order], s_sorted[inv_order]
+
+
+def _sigma0_from_profile(
+    pressure: ArrayLike | None,
+    temperature: ArrayLike,
+    salinity: ArrayLike,
+    *,
+    lon: float = 0.0,
+    lat: float = 0.0,
+) -> FloatArray:
+    gsw = _require_gsw()
+    t = np.asarray(temperature, dtype=float)
+    s = np.asarray(salinity, dtype=float)
+    p = np.zeros_like(t, dtype=float) if pressure is None else np.asarray(pressure, dtype=float)
+    p, t, s = np.broadcast_arrays(p, t, s)
+    p = np.asarray(p, dtype=float)
+    t = _fill_missing_profile_values(np.asarray(t, dtype=float), p)
+    s = _fill_missing_profile_values(np.asarray(s, dtype=float), p)
+    sa = np.asarray(gsw.SA_from_SP(s, p, lon, lat), dtype=float)
+    ct = np.asarray(gsw.CT_from_t(sa, t, p), dtype=float)
+    return np.asarray(gsw.sigma0(sa, ct), dtype=float)
+
+
+def _fill_missing_profile_values(values: FloatArray, pressure: FloatArray | None) -> FloatArray:
+    x = np.asarray(values, dtype=float).copy()
+    if x.size == 0:
+        return x
+    if pressure is None:
+        p = np.arange(x.size, dtype=float)
+    else:
+        p = np.asarray(pressure, dtype=float)
+        if p.shape != x.shape:
+            p = np.broadcast_to(p, x.shape).astype(float, copy=False)
+
+    finite = np.isfinite(x) & np.isfinite(p)
+    if int(np.sum(finite)) == 0:
+        return np.zeros_like(x, dtype=float)
+    if int(np.sum(finite)) == 1:
+        x[:] = x[finite][0]
+        return x
+
+    order = np.argsort(p[finite])
+    p_valid = _strictly_increasing_pressure(np.asarray(p[finite], dtype=float)[order])
+    x_valid = np.asarray(x[finite], dtype=float)[order]
+    out = x.copy()
+    missing = ~finite
+    if np.any(missing):
+        out[missing] = np.interp(p[missing], p_valid, x_valid)
+    return out
+
+
+def _require_gsw():
+    try:
+        import gsw  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - dependency should be present
+        raise ImportError(
+            "GSW is required for density calculations. Install with: pip install gsw "
+            "or pip install -e '.[train]'."
+        ) from exc
+    return gsw
+
+
+def _lookup_attr(attrs: Mapping[str, Any], names: tuple[str, ...]) -> Any | None:
+    for name in names:
+        if name in attrs:
+            return attrs[name]
+    return None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return None
+    return float(finite[0])
+
+
+def _strictly_increasing_pressure(pressure: FloatArray, *, min_step: float = 1e-6) -> FloatArray:
+    """Return a monotonically increasing copy of pressure."""
+    p = np.asarray(pressure, dtype=float).copy()
+    if p.size < 2:
+        return p
+    step = float(min_step)
+    if not np.isfinite(step) or step <= 0:
+        step = 1e-6
+    for i in range(1, p.size):
+        if not np.isfinite(p[i - 1]):
+            continue
+        if not np.isfinite(p[i]) or p[i] <= p[i - 1]:
+            p[i] = p[i - 1] + step
+    return p
 
 
 def _pava_non_decreasing(y: FloatArray) -> FloatArray:

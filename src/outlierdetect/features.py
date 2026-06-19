@@ -3,7 +3,8 @@
 The feature builder is the central input entry point for the neural network.
 It keeps the model mostly local by exposing residuals, normalized residuals,
 variability scales, vertical-heave scales, day-of-year phase, and sparse-profile
-geometry, but not latitude/longitude or full reference profiles.
+geometry. Latitude/longitude are not exposed as separate features, but they can
+be used internally for TEOS-10 density diagnostics when present in metadata.
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from .corrections import CorrectionPrior, estimate_correction_posterior
 from .data import NormalizationStats, ProfileInput
-from .density import density_proxy, inversion_metrics
+from .density import density_proxy, inversion_metrics, profile_location_from_attrs
 
 FloatArray = NDArray[np.float64]
 
@@ -28,6 +30,16 @@ class DetrendResult:
     residual: FloatArray
     sigma_intercept: float = np.nan
     sigma_slope: float = np.nan
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "intercept": float(self.intercept),
+            "slope": float(self.slope),
+            "trend": np.asarray(self.trend, dtype=float).tolist(),
+            "residual": np.asarray(self.residual, dtype=float).tolist(),
+            "sigma_intercept": float(self.sigma_intercept),
+            "sigma_slope": float(self.sigma_slope),
+        }
 
 
 @dataclass(slots=True)
@@ -169,6 +181,7 @@ def build_level_features(
     *,
     robust: bool = True,
     normalization: NormalizationStats | dict[str, float] | None = None,
+    correction_prior: CorrectionPrior | None = None,
 ) -> FeatureBatch:
     """Build per-level features for one sparse CTD-SRDL profile.
 
@@ -221,8 +234,9 @@ def build_level_features(
     d2tdp2 = _safe_gradient(dtdp, p)
     d2sdp2 = _safe_gradient(dsdp, p)
 
-    dens = density_proxy(t_raw, s_raw)
-    inv = inversion_metrics(p, t_raw, s_raw)
+    lon, lat = profile_location_from_attrs(profile.attrs)
+    dens = density_proxy(t_raw, s_raw, p, lon=lon, lat=lat)
+    inv = inversion_metrics(p, t_raw, s_raw, lon=lon, lat=lat)
     inv_mag = np.asarray(inv["level_inversion_magnitude"], dtype=float)
     rho_ts = np.clip(_nan_default(profile.rho_ts, default=0.0, n=n), -0.999, 0.999)
     has_residual_t = np.full(n, float(profile.residual_t is not None), dtype=float)
@@ -242,6 +256,30 @@ def build_level_features(
     detrended_s = _nan_default(ds_res.residual, default=0.0, n=n)
     detrended_z_t = detrended_t / np.maximum(sigma_t, 1e-12)
     detrended_z_s = detrended_s / np.maximum(sigma_s, 1e-12)
+
+    active_prior = correction_prior or CorrectionPrior.default()
+    correction_post = estimate_correction_posterior(profile, active_prior)
+    posterior_delta_t = _nan_default(correction_post.delta_t, default=0.0, n=n)
+    posterior_delta_s = _nan_default(correction_post.delta_s, default=0.0, n=n)
+    posterior_debiased_t = _nan_default(correction_post.debiased_residual_t, default=0.0, n=n)
+    posterior_debiased_s = _nan_default(correction_post.debiased_residual_s, default=0.0, n=n)
+    if norm is not None:
+        posterior_delta_t = posterior_delta_t / norm.temperature_scale
+        posterior_delta_s = posterior_delta_s / norm.salinity_scale
+        posterior_debiased_t = posterior_debiased_t / norm.temperature_scale
+        posterior_debiased_s = posterior_debiased_s / norm.salinity_scale
+    posterior_debiased_z_t = posterior_debiased_t / np.maximum(sigma_t, 1e-12)
+    posterior_debiased_z_s = posterior_debiased_s / np.maximum(sigma_s, 1e-12)
+    correction_prior_tension = np.full(n, float(correction_post.prior_tension), dtype=float)
+    correction_information_gain = np.full(n, float(correction_post.information_gain), dtype=float)
+    if correction_post.constraint_strength is None:
+        correction_constraint = np.zeros(4, dtype=float)
+    else:
+        correction_constraint = np.asarray(correction_post.constraint_strength, dtype=float)
+    correction_constraint_a_t = np.full(n, float(correction_constraint[0]), dtype=float)
+    correction_constraint_b_t = np.full(n, float(correction_constraint[1]), dtype=float)
+    correction_constraint_a_s = np.full(n, float(correction_constraint[2]), dtype=float)
+    correction_constraint_b_s = np.full(n, float(correction_constraint[3]), dtype=float)
 
     if profile.day_of_year is None:
         doy_sin = np.zeros(n, dtype=float)
@@ -275,6 +313,18 @@ def build_level_features(
         "detrended_residual_s",
         "detrended_z_t",
         "detrended_z_s",
+        "posterior_delta_t",
+        "posterior_delta_s",
+        "posterior_debiased_residual_t",
+        "posterior_debiased_residual_s",
+        "posterior_debiased_z_t",
+        "posterior_debiased_z_s",
+        "correction_prior_tension",
+        "correction_information_gain",
+        "correction_constraint_a_t",
+        "correction_constraint_b_t",
+        "correction_constraint_a_s",
+        "correction_constraint_b_s",
         "sigma_t",
         "sigma_s",
         "sigma_vert",
@@ -311,6 +361,18 @@ def build_level_features(
         detrended_s,
         detrended_z_t,
         detrended_z_s,
+        posterior_delta_t,
+        posterior_delta_s,
+        posterior_debiased_t,
+        posterior_debiased_s,
+        posterior_debiased_z_t,
+        posterior_debiased_z_s,
+        correction_prior_tension,
+        correction_information_gain,
+        correction_constraint_a_t,
+        correction_constraint_b_t,
+        correction_constraint_a_s,
+        correction_constraint_b_s,
         sigma_t,
         sigma_s,
         sigma_vert,
@@ -331,8 +393,11 @@ def build_level_features(
     diagnostics = {
         "t_detrend": dt_res,
         "s_detrend": ds_res,
+        "correction_posterior": correction_post,
         "max_density_inversion": inv["max_inversion"],
-        "feature_version": "profile_qc_v2_norm" if norm is not None else "profile_qc_v1",
+        "feature_version": "outlierdetect_v2_correction_prior_norm"
+        if norm is not None
+        else "outlierdetect_v3_gsw_sigma0_correction_prior",
     }
     if norm is not None:
         diagnostics["normalization"] = norm.as_dict()

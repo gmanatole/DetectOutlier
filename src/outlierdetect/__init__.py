@@ -1,10 +1,28 @@
-"""OutlierDetect package."""
+"""OutlierDetect profile QC package.
+
+The package combines sparse-profile ingestion, TEOS-10 density diagnostics,
+Gaussian nuisance correction, a small transformer model, and training helpers
+for CTD-SRDL-style quality control and reconstruction.
+"""
 
 from .argo import ArgoProfile, GOOD_QC_FLAGS, iter_argo_files, read_argo_file, sample_pressure_indices, subsample_profile
+from .en4 import iter_en4_files, read_en4_file
+from .corrections import CorrectionPosterior, CorrectionPrior
 from .data import NormalizationStats, NuisanceBias, ProfileInput, Result
 from .features import FeatureBatch, build_level_features, linear_detrend, robust_linear_detrend
 from .model import Net, NetConfig, ProfileNet, ProfileNetConfig
 from .parquet import ArgoParquetSummary, argo_directory_to_dataframe, collect_nc_paths, write_argo_parquet
+from .runtime_config import (
+    AppConfig,
+    HeaveConfig,
+    InputConfig,
+    PathConfig,
+    PredictConfig,
+    TrainConfig,
+    load_app_config,
+    resolve_profile_input,
+    resolved_run_config_dict,
+)
 from .tool import Config, Heuristic, Neural
 from .training import (
     ArgoTrainingConfig,
@@ -19,6 +37,9 @@ from .training import (
     build_argo_dataset,
     build_argo_examples,
     build_argo_synthetic_examples,
+    build_en4_dataset,
+    build_en4_examples,
+    build_en4_synthetic_examples,
     collate,
     collate_profiles,
     compute_loss,
@@ -37,30 +58,44 @@ __all__ = [
     "ArgoProfile",
     "ArgoTrainingConfig",
     "ArgoParquetSummary",
+    "AppConfig",
+    "CorrectionPosterior",
+    "CorrectionPrior",
     "Config",
     "Dataset",
     "Example",
     "FeatureBatch",
     "Heuristic",
+    "HeaveConfig",
     "Labels",
+    "InputConfig",
     "LossWeights",
     "Net",
     "NetConfig",
     "ProfileNet",
     "ProfileNetConfig",
+    "PathConfig",
     "Neural",
     "NuisanceBias",
     "NormalizationStats",
     "GOOD_QC_FLAGS",
+    "PredictConfig",
     "ProfileInput",
+    "resolve_profile_input",
+    "resolved_run_config_dict",
+    "load_app_config",
     "Result",
     "SyntheticExample",
+    "TrainConfig",
     "ProfileDataset",
     "ProfileExample",
     "ProfileLabels",
     "build_argo_dataset",
     "build_argo_examples",
     "build_argo_synthetic_examples",
+    "build_en4_dataset",
+    "build_en4_examples",
+    "build_en4_synthetic_examples",
     "compute_normalization_stats",
     "argo_directory_to_dataframe",
     "build_level_features",
@@ -71,12 +106,14 @@ __all__ = [
     "eval_epoch",
     "fit_model",
     "iter_argo_files",
+    "iter_en4_files",
     "collect_nc_paths",
     "load_checkpoint",
     "load_model_from_checkpoint",
     "linear_detrend",
     "loss",
     "read_argo_file",
+    "read_en4_file",
     "robust_linear_detrend",
     "sample_pressure_indices",
     "save_checkpoint",

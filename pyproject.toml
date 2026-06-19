@@ -28,6 +28,7 @@ dependencies = [
   "numpy>=1.24",
   "pyarrow>=15",
   "gsw>=3.6",
+  "tomli>=2.0; python_version < \"3.11\"",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +47,11 @@ dev = [
   "pytest>=7.4",
   "ruff>=0.4",
 ]
+docs = [
+  "sphinx>=8.1",
+  "myst-parser>=4.0",
+  "sphinx-autodoc-typehints>=2.3",
+]
 all = [
   "matplotlib>=3.8",
   "pandas>=2.0",
@@ -56,9 +62,13 @@ all = [
   "tqdm>=4.66",
   "pytest>=7.4",
   "ruff>=0.4",
+  "sphinx>=8.1",
+  "myst-parser>=4.0",
+  "sphinx-autodoc-typehints>=2.3",
 ]
 
 [project.scripts]
+outlierdetect = "outlierdetect.cli:main"
 outlier-detect = "outlierdetect.cli:main"
 outlierdetect-predict = "outlierdetect.cli:predict_main"
 outlierdetect-train = "outlierdetect.cli:train_main"

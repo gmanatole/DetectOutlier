@@ -1,20 +1,9 @@
-"""Argo float NetCDF reader for Tool 1 training.
+"""Argo float reader and processor for training.
 
-Reads core-Argo profile files (one file = one float, many profiles) or
-mono-profile files. Extracts PRES / TEMP_ADJUSTED / PSAL_ADJUSTED, applies
-QC-flag filtering, and returns clean arrays that can be fed directly into
-``degrade_highres_profile``.
-
-NetCDF backend priority (first available wins)
-----------------------------------------------
-1. ``netCDF4``    – fastest, handles both CLASSIC and NetCDF-4/HDF5.
-2. ``h5py``       – handles NetCDF-4/HDF5 directly.
-3. ``scipy.io``   – handles NetCDF-3 CLASSIC only (many older Argo files).
-
-Install at least one:
-    pip install netCDF4          # recommended
-    pip install h5py             # alternative for HDF5-backed files
-    # scipy is usually present already
+This module owns the Argo-specific profile structure, file traversal, and
+pressure subsampling logic. NetCDF opening and array normalization live in
+``outlierdetect.netcdf_backend`` so EN4 and Argo can share the same low-level
+I/O backend without the training stack traces looking Argo-specific.
 """
 
 from __future__ import annotations
@@ -26,100 +15,12 @@ from typing import Any, Iterator
 import numpy as np
 from numpy.typing import NDArray
 
+from .netcdf_backend import _get_qc, _get_var, _has_var, _open_nc, _profile_meta_value
+
 FloatArray = NDArray[np.float64]
 
-# ---------------------------------------------------------------------------
-# NetCDF backend detection
-# ---------------------------------------------------------------------------
-
-def _open_nc(path: str | Path):
-    """Return an object that supports dict-like variable access.
-
-    Tries backends in order and returns the first that succeeds.
-    The returned object is kept open; close it when done.
-    """
-    path = str(path)
-
-    # 1. netCDF4 (handles NC3 + NC4/HDF5)
-    try:
-        import netCDF4  # noqa: PLC0415
-        return netCDF4.Dataset(path, "r")
-    except ImportError:
-        pass
-    except Exception as exc:
-        raise RuntimeError(f"netCDF4 failed to open {path}: {exc}") from exc
-
-    # 2. h5py (NC4/HDF5 only, but no HDF5 dimension-scale metadata)
-    try:
-        import h5py  # noqa: PLC0415
-        return h5py.File(path, "r")
-    except ImportError:
-        pass
-    except Exception:
-        pass  # not HDF5 – fall through to scipy
-
-    # 3. scipy (NC3 CLASSIC only)
-    try:
-        from scipy.io import netcdf_file  # noqa: PLC0415
-        return netcdf_file(path, "r", mmap=False)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not open {path} with any available NetCDF backend.\n"
-            "Install a backend: pip install netCDF4   (recommended)\n"
-            "                   pip install h5py      (HDF5/NC4 files)\n"
-            f"Original error: {exc}"
-        ) from exc
-
-
-def _get_var(ds, name: str) -> np.ndarray:
-    """Extract a variable as a plain numpy float64 array, handling fill values."""
-    var = ds[name]
-    # netCDF4 Dataset, h5py Dataset, and scipy netcdf_variable all support [:]
-    data = np.asarray(var[:], dtype=np.float64)
-
-    # Mask fill / missing values → NaN
-    fill_candidates = []
-    for attr in ("_FillValue", "missing_value", "fill_value"):
-        try:
-            fill_candidates.append(float(getattr(var, attr, None) or np.nan))
-        except Exception:
-            pass
-    for fv in fill_candidates:
-        if np.isfinite(fv):
-            data[data == fv] = np.nan
-
-    # netCDF4 masked arrays
-    if hasattr(data, "filled"):
-        data = data.filled(np.nan)
-
-    return data
-
-
-def _get_qc(ds, name: str) -> np.ndarray | None:
-    """Return QC flag array as uint8, or None if variable does not exist."""
-    if not _has_var(ds, name):
-        return None
-    raw = np.asarray(ds[name][:])
-    # QC flags may be stored as bytes (b'1') or characters or integers
-    if raw.dtype.kind in ("S", "U", "O"):  # byte-string / str
-        flat = raw.flatten()
-        out = np.zeros(flat.shape, dtype=np.uint8)
-        for i, v in enumerate(flat):
-            try:
-                out[i] = int(v) if v not in (b"", "", None) else 9
-            except Exception:
-                out[i] = 9
-        return out.reshape(raw.shape)
-    if raw.dtype.kind in ("i", "u", "f"):
-        return raw.astype(np.uint8)
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Public data structures
-# ---------------------------------------------------------------------------
-
-#: QC flags considered "good" for Argo (ADMT standard)
+# QC flags considered "good" for Argo (ADMT standard)
 GOOD_QC_FLAGS: frozenset[int] = frozenset({1, 2})
 
 
@@ -135,6 +36,8 @@ class ArgoProfile:
     cycle_number: int | None = None
     float_wmo: str | None = None
     juld: float | None = None   # Julian days since 1950-01-01
+    latitude: float | None = None
+    longitude: float | None = None
 
     def __post_init__(self) -> None:
         self.n_levels = int(self.pressure.size)
@@ -154,7 +57,7 @@ class ArgoProfile:
         day_of_year: float | None = None,
         attrs: dict[str, Any] | None = None,
     ) -> "ProfileInput":
-        """Convert this Argo profile into a :class:`~outlierdetect.data.ProfileInput`.
+        """Convert this Argo profile into a :class: outlierdetect.data.ProfileInput.
 
         The inference path uses this to turn raw Argo or parquet-backed profiles
         into the sparse profile object consumed by the model.
@@ -165,10 +68,12 @@ class ArgoProfile:
         temperature = np.asarray(self.temperature, dtype=float)
         salinity = np.asarray(self.salinity, dtype=float)
 
+        # Check profile validity
         valid = np.isfinite(pressure) & np.isfinite(temperature) & np.isfinite(salinity) & (pressure >= 0.0)
         if int(np.sum(valid)) < 2:
             raise ValueError("Profile must contain at least two finite non-negative levels.")
 
+        # Get doy array
         if day_of_year is None and self.juld is not None and np.isfinite(self.juld):
             day_of_year = float(np.mod(self.juld, 365.2425))
 
@@ -176,6 +81,8 @@ class ArgoProfile:
             "float_wmo": self.float_wmo,
             "cycle_number": self.cycle_number,
             "juld": self.juld,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
         }
         if attrs:
             profile_attrs.update(attrs)
@@ -191,15 +98,15 @@ class ArgoProfile:
         )
 
 
-# ---------------------------------------------------------------------------
+
 # Core reader
-# ---------------------------------------------------------------------------
 
 def read_argo_file(
     path: str | Path,
     good_qc_only: bool = True,
     good_qc_flags: frozenset[int] = GOOD_QC_FLAGS,
     min_levels: int = 5,
+    use_raw_values: bool = False,
 ) -> list[ArgoProfile]:
     """Read all profiles from a single Argo NetCDF file.
 
@@ -212,6 +119,8 @@ def read_argo_file(
         If True (default), set data to NaN where QC flags are not in
         ``good_qc_flags``.  Disabling this passes raw adjusted values through
         without flag-based masking.
+    use_raw_values:
+        If True, read ``TEMP`` and ``PSAL`` directly and skip QC masking.
     good_qc_flags:
         Set of Argo QC flag values considered acceptable (default: {1, 2}).
     min_levels:
@@ -226,7 +135,14 @@ def read_argo_file(
     path = Path(path)
     ds = _open_nc(path)
     try:
-        profiles = _parse_profiles(ds, path.stem, good_qc_only, good_qc_flags, min_levels)
+        profiles = _parse_profiles(
+            ds,
+            path.stem,
+            good_qc_only and not use_raw_values,
+            good_qc_flags,
+            min_levels,
+            use_raw_values=use_raw_values,
+        )
     finally:
         try:
             ds.close()
@@ -241,6 +157,8 @@ def _parse_profiles(
     good_qc_only: bool,
     good_qc_flags: frozenset[int],
     min_levels: int,
+    *,
+    use_raw_values: bool = False,
 ) -> list[ArgoProfile]:
     """Internal: extract profiles from an open dataset handle."""
 
@@ -249,8 +167,12 @@ def _parse_profiles(
     #   (N_PROF, N_LEVELS) – multi-profile "Sprof" or "Rprof"
     #   (N_LEVELS,)        – single-profile mono files
     pres_raw = _get_var(ds, "PRES")
-    temp_raw = _get_var(ds, "TEMP_ADJUSTED")
-    psal_raw = _get_var(ds, "PSAL_ADJUSTED")
+    if use_raw_values:
+        temp_raw = _get_var(ds, "TEMP")
+        psal_raw = _get_var(ds, "PSAL")
+    else:
+        temp_raw = _get_var(ds, "TEMP_ADJUSTED")
+        psal_raw = _get_var(ds, "PSAL_ADJUSTED")
 
     two_d = pres_raw.ndim == 2
     if pres_raw.ndim == 1:
@@ -261,9 +183,14 @@ def _parse_profiles(
     n_prof, _ = pres_raw.shape
 
     # ------------------------------------------------------------------ QC
-    pres_qc = _get_qc(ds, "PRES_QC")
-    temp_qc = _get_qc(ds, "TEMP_ADJUSTED_QC")
-    psal_qc = _get_qc(ds, "PSAL_ADJUSTED_QC")
+    if use_raw_values:
+        pres_qc = None
+        temp_qc = None
+        psal_qc = None
+    else:
+        pres_qc = _get_qc(ds, "PRES_QC")
+        temp_qc = _get_qc(ds, "TEMP_ADJUSTED_QC")
+        psal_qc = _get_qc(ds, "PSAL_ADJUSTED_QC")
 
     if pres_qc is not None and pres_qc.ndim == 1 and two_d:
         pres_qc = pres_qc[np.newaxis, :]
@@ -275,6 +202,8 @@ def _parse_profiles(
     # ------------------------------------------------------------------ meta
     cycle_numbers: list[int | None] = [None] * n_prof
     juldays: list[float | None] = [None] * n_prof
+    latitudes: list[float | None] = [None] * n_prof
+    longitudes: list[float | None] = [None] * n_prof
     float_wmo: str | None = None
 
     if _has_var(ds, "CYCLE_NUMBER"):
@@ -290,6 +219,16 @@ def _parse_profiles(
         for k in range(min(n_prof, len(jd))):
             if np.isfinite(jd[k]):
                 juldays[k] = float(jd[k])
+
+    if _has_var(ds, "LATITUDE"):
+        lat_raw = np.asarray(ds["LATITUDE"][:], dtype=float)
+        for k in range(n_prof):
+            latitudes[k] = _profile_meta_value(lat_raw, k)
+
+    if _has_var(ds, "LONGITUDE"):
+        lon_raw = np.asarray(ds["LONGITUDE"][:], dtype=float)
+        for k in range(n_prof):
+            longitudes[k] = _profile_meta_value(lon_raw, k)
 
     for attr in ("PLATFORM_NUMBER", "PLATFORM_CODE"):
         if _has_var(ds, attr):
@@ -307,7 +246,7 @@ def _parse_profiles(
     if not float_wmo:
         float_wmo = stem
 
-    # ------------------------------------------------------------------ build
+    # build
     profiles: list[ArgoProfile] = []
     for k in range(n_prof):
         p = pres_raw[k].copy()
@@ -345,6 +284,8 @@ def _parse_profiles(
             cycle_number=cycle,
             float_wmo=float_wmo,
             juld=juldays[k],
+            latitude=latitudes[k],
+            longitude=longitudes[k],
         )
         if prof.is_valid(min_levels):
             profiles.append(prof)
@@ -372,15 +313,26 @@ def _has_var(ds, name: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Directory scanner
-# ---------------------------------------------------------------------------
+def _profile_meta_value(raw: np.ndarray, index: int) -> float | None:
+    """Return a profile-level metadata value from a potentially multi-dimensional array."""
+    arr = np.asarray(raw, dtype=float)
+    if arr.ndim == 0:
+        return float(arr) if np.isfinite(arr) else None
+    if index >= arr.shape[0]:
+        return None
+    sample = np.asarray(arr[index], dtype=float).reshape(-1)
+    finite = sample[np.isfinite(sample)]
+    if finite.size == 0:
+        return None
+    return float(finite[0])
+
 
 def iter_argo_files(
     root: str | Path,
     pattern: str = "**/*.nc",
     good_qc_only: bool = True,
     min_levels: int = 5,
+    use_raw_values: bool = False,
 ) -> Iterator[ArgoProfile]:
     """Recursively yield ArgoProfile objects from all .nc files under *root*.
 
@@ -392,6 +344,8 @@ def iter_argo_files(
         Glob pattern relative to *root* (default: ``**/*.nc``).
     good_qc_only, min_levels:
         Forwarded to :func:`read_argo_file`.
+    use_raw_values:
+        If True, prefer raw ``TEMP``/``PSAL`` values and skip QC masking.
 
     Yields
     ------
@@ -406,17 +360,17 @@ def iter_argo_files(
 
     for nc_path in files:
         try:
-            for prof in read_argo_file(nc_path, good_qc_only=good_qc_only,
-                                       min_levels=min_levels):
+            for prof in read_argo_file(
+                nc_path,
+                good_qc_only=good_qc_only,
+                min_levels=min_levels,
+                use_raw_values=use_raw_values,
+            ):
                 yield prof
         except Exception as exc:
             import warnings
             warnings.warn(f"Skipping {nc_path}: {exc}", stacklevel=2)
 
-
-# ---------------------------------------------------------------------------
-# Random subsampling for inference (any-size profile → sparse CTD-SRDL-like)
-# ---------------------------------------------------------------------------
 
 def subsample_profile(
     pressure: FloatArray,
