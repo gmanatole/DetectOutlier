@@ -1,0 +1,423 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,booktabs,longtable,tabularx,array,enumitem}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7em}
+\setlength{\emergencystretch}{3em}
+\renewcommand{\arraystretch}{1.15}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\pkg}[1]{\textsc{#1}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{OutlierDetect Pipeline and Module Guide}
+\author{Generated from the current repository state}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Scope}
+OutlierDetect is a profile-level quality-control and reconstruction system for sparse CTD-SRDL-style ocean profiles. The package is organized around one shared data contract, one feature builder, one physical correction layer, and two execution paths:
+an inference path that returns a structured result object, and a training path that creates synthetic labels from clean source profiles.
+
+This report describes the current pipeline in the repository as it exists now, including the module boundaries and the way the CLI, config layer, physics layer, feature builder, synthetic training generator, model, and artifact writer fit together.
+
+\section{End-to-End Pipeline}
+At a high level, the system moves through these stages:
+\begin{enumerate}[leftmargin=*]
+  \item Read a profile source from NetCDF or parquet.
+  \item Convert it into a \code{ProfileInput} object with pressure, temperature, salinity, optional residuals, uncertainty scales, and metadata.
+  \item Build per-level physical and statistical features, including density diagnostics and nuisance-correction features.
+  \item Run either the heuristic baseline or the neural model to obtain profile-level and point-level outlier probabilities.
+  \item Optionally reconstruct a stable temperature/salinity profile on a fixed pressure grid.
+  \item Persist the result as a structured \code{Result} object, JSON sidecars, plots, checkpoints, and run metadata.
+\end{enumerate}
+
+Training uses the same input contract, but adds one extra stage before feature construction: a clean source profile is degraded synthetically to create sparse, noisy, labeled training examples. The training path is therefore:
+
+\begin{enumerate}[leftmargin=*]
+  \item Read clean Argo or EN4 source profiles.
+  \item Generate sparse synthetic examples with known labels.
+  \item Compute normalization statistics from the training side only.
+  \item Pad variable-length profiles into batches.
+  \item Train the multitask transformer with profile QC, point QC, nuisance regression, and reconstruction losses.
+  \item Save progress JSON, plots, and a checkpoint.
+\end{enumerate}
+
+\subsection{Train/Test Semantics}
+The current training CLI distinguishes between the source used for model fitting and the held-out source used for evaluation:
+\begin{itemize}[leftmargin=*]
+  \item \code{--train-root} is the canonical training input root.
+  \item \code{--test-root}, when provided, is treated as a separate held-out root.
+  \item The training side uses the adjusted/QC-filtered reader path.
+  \item The held-out side uses the raw reader path, meaning \code{TEMP}/\code{PSAL} without QC masking for Argo and the equivalent raw selection for EN4.
+  \item If \code{--test-root} is omitted, the training root is split internally with \code{--val-fraction}.
+\end{itemize}
+That split matters because it lets you compare performance on adjusted/corrected training sources against a raw held-out distribution later.
+
+\section{Shared Data Contracts}
+The package keeps data exchange simple on purpose. Most modules pass around a small set of dataclasses rather than large opaque structures.
+
+\subsection{ProfileInput}
+\code{ProfileInput} in \path{src/outlierdetect/data.py} is the central input object. It holds:
+\begin{itemize}[leftmargin=*]
+  \item pressure, temperature, and salinity arrays;
+  \item optional residuals against a reference profile;
+  \item uncertainty scales for temperature, salinity, vertical heave, and heave-derived uncertainty;
+  \item an optional T/S correlation coefficient;
+  \item day-of-year, profile ID, and arbitrary metadata.
+\end{itemize}
+It validates that pressure is one-dimensional, finite, non-negative, and sorted, and that temperature and salinity each contain at least one finite value.
+
+\subsection{NormalizationStats}
+\code{NormalizationStats} stores per-run mean and standard deviation values for temperature and salinity. Training computes it from the training examples only, then reuses it when normalizing inputs and reconstruction targets.
+
+\subsection{NuisanceBias and Result}
+\code{NuisanceBias} is the backwards-compatible summary for the local linear nuisance terms:
+\[
+  [a_t, b_t, a_s, b_s]
+\]
+where the slopes are expressed per km in the correction layer and per normalized pressure in the feature builder.
+
+\code{Result} is the main output object returned by predictors. It contains:
+\begin{itemize}[leftmargin=*]
+  \item \code{profile_bad_probability}
+  \item point-level probabilities for temperature, salinity, and density inconsistency
+  \item \code{nuisance_bias}
+  \item \code{correction_posterior}
+  \item reconstructed pressure, temperature, salinity, and uncertainty bands
+  \item feature names and diagnostics
+  \item the originating profile ID
+\end{itemize}
+
+\section{Input and Ingestion Modules}
+\subsection{netcdf\_backend.py}
+\path{src/outlierdetect/netcdf_backend.py} owns the low-level NetCDF opening and array extraction logic. It tries multiple backends so the rest of the code does not care which reader library is available. The reader path is designed to survive the common variations you see in oceanographic files:
+\begin{itemize}[leftmargin=*]
+  \item \code{netCDF4}
+  \item \code{h5py}
+  \item \code{scipy.io.netcdf_file}
+  \item a padded fallback for truncated HDF5-style files
+\end{itemize}
+Higher-level modules use the helper functions from here to read variables, QC flags, and profile metadata without repeating backend-specific code.
+
+\subsection{\code{argo.py}}
+\path{src/outlierdetect/argo.py} parses Argo float files into \code{ArgoProfile} objects. It is responsible for:
+\begin{itemize}[leftmargin=*]
+  \item discovering profile structure in single-profile and multi-profile files;
+  \item reading the standard Argo variables;
+  \item applying QC masking when requested;
+  \item extracting metadata such as cycle number, float WMO, JULD, latitude, and longitude;
+  \item converting the result into \code{ProfileInput}.
+\end{itemize}
+
+The reader has two important modes:
+\begin{itemize}[leftmargin=*]
+  \item default mode uses \code{TEMP\_ADJUSTED}, \code{PSAL\_ADJUSTED}, and Argo QC flags;
+  \item raw mode uses \code{TEMP} and \code{PSAL} directly and skips QC masking.
+\end{itemize}
+That raw mode is what the held-out test root now uses.
+
+\subsection{\code{en4.py}}
+\path{src/outlierdetect/en4.py} does the same job for EN4 monthly files, but with EN4-specific variable discovery. It selects pressure, temperature, and salinity from the candidate names exposed by the dataset and can also operate in raw mode for held-out evaluation.
+
+The key point is that EN4 is normalized into the same \code{ArgoProfile} shape, which keeps the downstream synthetic builder source-agnostic.
+
+\subsection{\code{parquet.py}}
+\path{src/outlierdetect/parquet.py} provides raw data export and iteration over parquet-backed profile data. This is useful when you want to stage NetCDF data once and then iterate over a lighter-weight representation later. It sits outside the core physical pipeline, but it is part of the ingest path.
+
+\section{Physics, Corrections, and Feature Construction}
+\subsection{\code{density.py}}
+\path{src/outlierdetect/density.py} replaces the old linear density proxy with TEOS-10/GSW-based sigma0 calculations. The module provides:
+\begin{itemize}[leftmargin=*]
+  \item \code{density\_proxy} as a compatibility alias for sigma0;
+  \item \code{sigma0\_from\_ts} for T-S plots;
+  \item \code{inversion\_metrics} for density inversions and inversion magnitude;
+  \item \code{stable\_project\_salinity\_only} for salinity-only stability projection.
+\end{itemize}
+
+The density diagnostics matter in two places:
+\begin{itemize}[leftmargin=*]
+  \item the feature builder uses them to flag unstable structure;
+  \item the heuristic baseline uses them directly when scoring point anomalies and reconstructions.
+\end{itemize}
+
+\subsection{\code{corrections.py}}
+\path{src/outlierdetect/corrections.py} implements a Gaussian nuisance correction model over the 4D latent vector
+\[
+  c = [a_t, b_t, a_s, b_s]^T.
+\]
+The model is deliberately physical:
+\begin{itemize}[leftmargin=*]
+  \item temperature and salinity offsets are allowed to differ;
+  \item slopes are softly constrained;
+  \item temperature and salinity terms may be correlated;
+  \item the posterior can be refined with point weights from the QC heads.
+\end{itemize}
+
+CorrectionPrior stores the mean and covariance of the latent correction terms.
+CorrectionPosterior stores the updated Gaussian posterior, the debiased residuals, the pointwise correction deltas, prior tension, information gain, and diagnostic status.
+
+The prior is used by both the heuristic and the neural feature path. The posterior is not a final tag-adjustment system; it is an explicit nuisance layer for bias-insensitive QC.
+
+\subsection{\code{features.py}}
+\path{src/outlierdetect/features.py} is the central feature entry point for both inference and training. It builds one feature row per observed level and returns a \code{FeatureBatch} containing:
+\begin{itemize}[leftmargin=*]
+  \item \code{level\_features}
+  \item \code{feature\_names}
+  \item a valid-level mask
+  \item diagnostics such as detrend fits, correction posterior, and feature version
+\end{itemize}
+
+The current feature vector has 46 columns. It covers:
+\begin{itemize}[leftmargin=*]
+  \item pressure geometry: normalized pressure, neighbor gaps, edge flags;
+  \item raw state: temperature and salinity, optionally normalized by training stats;
+  \item local shape: first and second derivatives of T and S;
+  \item density: sigma0 proxy and inversion magnitude;
+  \item residuals: residual T/S, z-scores, detrended residuals, and detrended z-scores;
+  \item correction features: posterior deltas, debiased residuals, correction tension, information gain, and constraint strengths;
+  \item uncertainty inputs: \code{sigma\_t}, \code{sigma\_s}, \code{sigma\_vert}, \code{sigma\_heave\_t}, \code{sigma\_heave\_s};
+  \item contextual inputs: \code{rho\_ts}, day-of-year sine/cosine, and presence flags.
+\end{itemize}
+
+The builder also computes robust or standard linear detrends of residuals against pressure, which gives the model a cheap way to reason about coherent biases without reconstructing the full reference profile.
+
+\section{Inference Path}
+\subsection{\code{tool.py}}
+\path{src/outlierdetect/tool.py} provides the two predictor-facing classes:
+\begin{itemize}[leftmargin=*]
+  \item \code{Heuristic}, a transparent baseline;
+  \item \code{Neural}, the trainable wrapper around the transformer model.
+\end{itemize}
+
+Both predictors return the same \code{Result} object, so downstream consumers do not need to care whether the scores came from a rule-based path or a learned path.
+
+\subsection{Heuristic baseline}
+The heuristic path is intentionally explicit. It:
+\begin{enumerate}[leftmargin=*]
+  \item builds level features;
+  \item computes point-level bad probabilities from detrended z-scores, curvature, and density inversion magnitude;
+  \item optionally refits the correction posterior with point weights;
+  \item combines point scores into a profile-level bad probability;
+  \item reconstructs temperature and salinity on a pressure grid when enabled.
+\end{enumerate}
+
+The scoring logic is simple enough to inspect and use as a debugging baseline. It is not the final system, but it anchors the API and makes regression testing straightforward.
+
+\subsection{Neural wrapper}
+The neural wrapper converts the same \code{ProfileInput} into features, passes them through the transformer, and maps the outputs back into the shared \code{Result} contract. It exists to keep the model interface stable while the learned system evolves.
+
+\section{Synthetic Training Data}
+\subsection{Shared synthetic builder}
+\path{src/outlierdetect/training/builders.py} is the bridge from clean source profiles to synthetic training examples. Its job is to:
+\begin{itemize}[leftmargin=*]
+  \item preserve each profile's native pressure sampling;
+  \item sample sparse pressure indices per profile;
+  \item feed the high-resolution source to the synthetic degradation function;
+  \item carry metadata into the synthetic example.
+\end{itemize}
+There is no global resampling step that forces every source profile onto the same observed pressure grid before corruption.
+
+\subsection{\code{training/synthetic.py}}
+\code{training/synthetic.py} contains the actual corruption model. \code{degrade\_highres\_profile} takes a clean, high-resolution profile and turns it into a sparse labeled training example with:
+\begin{itemize}[leftmargin=*]
+  \item coherent T/S offsets and slopes;
+  \item isolated spikes;
+  \item pressure errors;
+  \item occasional global bad profiles;
+  \item heave/reference noise;
+  \item density-inversion labels;
+  \item a reconstruction truth grid.
+\end{itemize}
+
+This module is where the supervised learning problem is manufactured. The labels are synthetic by construction, which is why the rest of the training stack can be compact.
+
+\subsection{\code{training/argo.py} and \code{training/en4.py}}
+These modules adapt the source readers to the synthetic builder:
+\begin{itemize}[leftmargin=*]
+  \item \path{src/outlierdetect/training/argo.py} converts Argo profiles into synthetic examples;
+  \item \path{src/outlierdetect/training/en4.py} does the same for EN4;
+  \item both accept \code{use\_raw\_values};
+  \item both forward clean profiles into the shared corruption pipeline.
+\end{itemize}
+
+In the current pipeline, the training root uses adjusted/QC-filtered source data, while the held-out test root uses raw values. That is the mechanism that lets you compare performance against a different data preparation regime later.
+
+\section{Training Dataset and Batching}
+\subsection{\code{training/dataset.py}}
+\path{src/outlierdetect/training/dataset.py} defines the dataset objects and the padding logic.
+
+\code{ProfileExample} pairs a \code{ProfileInput} with labels. \code{ProfileLabels} stores:
+\begin{itemize}[leftmargin=*]
+  \item profile-level bad/good labels;
+  \item point-level labels for temperature, salinity, and density inconsistency;
+  \item nuisance means;
+  \item reconstruction truth on a fixed pressure grid;
+  \item optional extra metadata.
+\end{itemize}
+
+\code{ProfileDataset} lazily builds features when indexed. This keeps the representation simple and makes feature revisions cheap during development. \code{collate\_profiles} pads a batch of variable-length profiles into tensors and masks. \code{compute\_normalization\_stats} derives temperature and salinity scaling from the training examples only.
+
+\section{Model Architecture}
+\subsection{\code{model.py}}
+\path{src/outlierdetect/model.py} defines the neural network used by the training loop.
+
+\code{NetConfig} describes the model size:
+\begin{itemize}[leftmargin=*]
+  \item input dimension;
+  \item hidden size;
+  \item number of transformer layers and heads;
+  \item dropout;
+  \item grid size for reconstruction.
+\end{itemize}
+
+\code{Net} is a compact transformer encoder for irregular profiles. The input tensor has shape
+\[
+  [\text{batch}, \text{n\_levels}, \text{input\_dim}]
+\]
+and a boolean mask marks valid levels.
+
+The model has four heads:
+\begin{itemize}[leftmargin=*]
+  \item a point head for per-level QC logits;
+  \item a profile head for profile-level QC;
+  \item a nuisance head for the 4D correction posterior;
+  \item a reconstruction head for temperature and salinity on a fixed grid.
+\end{itemize}
+
+The reconstruction branch combines a pooled profile embedding with encoded pressure-grid features, which lets the model predict a profile on a caller-defined standard grid without forcing the input observations onto that grid.
+
+\section{Training Objective and Loop}
+\subsection{\code{training/train.py}}
+\path{src/outlierdetect/training/train.py} contains the loss definition and the per-epoch loop.
+
+The total loss is a weighted sum of:
+\[
+  \mathcal{L} =
+  \lambda_p \mathcal{L}_{profile} +
+  \lambda_q \mathcal{L}_{point} +
+  \lambda_n \mathcal{L}_{nuisance} +
+  \lambda_{kl} \mathrm{KL}(q \| p) +
+  \lambda_r \mathcal{L}_{recon} +
+  \lambda_u \mathcal{L}_{uncertainty}.
+\]
+
+Concretely:
+\begin{itemize}[leftmargin=*]
+  \item profile QC and point QC use binary cross-entropy with logits;
+  \item nuisance regression uses a Gaussian negative log-likelihood;
+  \item the nuisance head is regularized toward the physical prior;
+  \item reconstruction uses a Gaussian NLL when reconstruction targets are present;
+  \item the uncertainty term discourages pathological predicted uncertainty.
+\end{itemize}
+
+\code{fit\_model} runs alternating train and eval epochs and can prefix evaluation metrics with \code{val\_} or \code{test\_} depending on the configured evaluation label. That prefixing is what lets the same training loop report either split without changing downstream consumers.
+
+\subsection{Checkpointing}
+\code{save\_checkpoint} stores the model weights and a small metadata block. The metadata typically includes input dimension, grid size, feature names, normalization stats, and the resolved run configuration.
+
+\section{Runtime Configuration and CLI}
+\subsection{runtime\_config.py}
+\path{src/outlierdetect/runtime_config.py} owns typed configuration loading and path resolution. The config schema is split into dataclasses:
+\begin{itemize}[leftmargin=*]
+  \item \code{PathConfig}
+  \item \code{HeaveConfig}
+  \item \code{InputConfig}
+  \item \code{TrainConfig}
+  \item \code{PredictConfig}
+  \item \code{AppConfig}
+\end{itemize}
+
+The loader reads TOML, resolves paths relative to the config file, and keeps backward compatibility with older \code{argo\_root} training configs by mapping them to \code{train\_root}.
+
+\subsection{\code{cli.py}}
+\path{src/outlierdetect/cli.py} is intentionally thin. It parses user-facing arguments, resolves the runtime config, and delegates to the lower-level modules.
+
+The installed console entry points are:
+\begin{itemize}[leftmargin=*]
+  \item \code{outlierdetect}
+  \item \code{outlier-detect}
+  \item \code{outlierdetect-predict}
+  \item \code{outlierdetect-train}
+\end{itemize}
+
+The top-level CLI also exposes config management:
+\begin{itemize}[leftmargin=*]
+  \item \code{outlierdetect config init}
+  \item \code{outlierdetect config show}
+  \item \code{outlierdetect config validate}
+\end{itemize}
+
+Other workflow flags include raw-to-parquet export, prediction, training, optional heave source selection, and input toggles for residuals, uncertainty scales, and seasonal phase. Prediction still uses \code{--argo-root}, because that flag names the inference input root. Training now uses \code{--train-root}.
+
+\section{Artifacts and Run Outputs}
+\subsection{\code{training/artifacts.py}}
+\path{src/outlierdetect/training/artifacts.py} writes the per-epoch run artifacts. A training run typically produces:
+\begin{itemize}[leftmargin=*]
+  \item a run directory under the configured run root;
+\item a progress JSON file with epoch histories and selected examples;
+\item sampled reconstruction plots under \code{plots/epoch\_XXX/};
+\item prediction JSON sidecars for the sampled profiles;
+\item a final checkpoint if an output path is configured.
+\end{itemize}
+
+The progress file records the current evaluation label, counts for train and eval examples, selected profile IDs, and the latest metrics snapshot. This makes it easy to inspect a run without loading the checkpoint.
+
+\section{Module Map}
+\small
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.42\linewidth}}
+\toprule
+Module & Role & Key objects / functions \\
+\midrule
+\endfirsthead
+\toprule
+Module & Role & Key objects / functions \\
+\midrule
+\endhead
+\path{src/outlierdetect/data.py} & Shared input/output dataclasses & \code{ProfileInput}, \code{Result}, \code{NuisanceBias}, \code{NormalizationStats} \\
+\path{src/outlierdetect/density.py} & TEOS-10 density and stability & \code{density\_proxy}, \code{inversion\_metrics}, \code{stable\_project\_salinity\_only} \\
+\path{src/outlierdetect/corrections.py} & Bayesian nuisance correction & \code{CorrectionPrior}, \code{CorrectionPosterior}, \code{estimate\_correction\_posterior} \\
+\path{src/outlierdetect/features.py} & Feature construction & \code{build\_level\_features}, \code{FeatureBatch}, \code{linear\_detrend} \\
+\path{src/outlierdetect/netcdf_backend.py} & Low-level file opening & backend selection helpers for NetCDF/HDF5 access \\
+\path{src/outlierdetect/argo.py} & Argo profile reading & \code{ArgoProfile}, \code{read\_argo\_file}, \code{iter\_argo\_files} \\
+\path{src/outlierdetect/en4.py} & EN4 profile reading & \code{read\_en4\_file}, \code{iter\_en4\_files} \\
+\path{src/outlierdetect/parquet.py} & Parquet staging/export & \code{write\_argo\_parquet}, \code{iter\_argo\_parquet\_profiles} \\
+\path{src/outlierdetect/tool.py} & Inference wrappers & \code{Heuristic}, \code{Neural}, \code{Config} \\
+\path{src/outlierdetect/model.py} & Transformer network & \code{NetConfig}, \code{Net}, \code{masked\_mean} \\
+\path{src/outlierdetect/runtime_config.py} & TOML and path resolution & \code{AppConfig}, \code{TrainConfig}, \code{PredictConfig}, loaders \\
+\path{src/outlierdetect/cli.py} & Command-line entry points & \code{main}, \code{train\_main}, \code{predict\_main}, config commands \\
+\path{src/outlierdetect/training/dataset.py} & Dataset and collation & \code{ProfileExample}, \code{ProfileLabels}, \code{ProfileDataset}, \code{collate\_profiles} \\
+\path{src/outlierdetect/training/synthetic.py} & Synthetic corruption & \code{degrade\_highres\_profile} \\
+\path{src/outlierdetect/training/builders.py} & Shared synthetic builder & convert clean profiles into synthetic examples \\
+\path{src/outlierdetect/training/argo.py} & Argo training bridge & \code{build\_argo\_synthetic\_examples} \\
+\path{src/outlierdetect/training/en4.py} & EN4 training bridge & \code{build\_en4\_synthetic\_examples} \\
+\path{src/outlierdetect/training/train.py} & Loss and epoch loop & \code{compute\_loss}, \code{train\_epoch}, \code{eval\_epoch}, \code{fit\_model} \\
+\path{src/outlierdetect/training/artifacts.py} & Run artifacts & \code{TrainingRunWriter}, progress JSON, plots, prediction sidecars \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Closing Notes}
+The current design keeps the main contracts narrow:
+\begin{itemize}[leftmargin=*]
+  \item \code{ProfileInput} describes a profile.
+  \item \code{FeatureBatch} describes the derived per-level representation.
+  \item \code{Result} describes the model output.
+  \item synthetic training examples provide labels without changing the runtime inference contract.
+\end{itemize}
+
+That separation is what makes the codebase easy to extend. You can change the readers, the synthetic corruption model, or the neural network independently as long as those three contracts stay stable.
+
+\end{document}
