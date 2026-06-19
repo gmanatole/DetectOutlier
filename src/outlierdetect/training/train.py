@@ -6,7 +6,7 @@ experiment management, logging, and data ingestion to project-specific scripts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,12 +19,16 @@ except Exception:  # pragma: no cover - torch is optional
     F = None  # type: ignore[assignment]
     nn = Any  # type: ignore[assignment]
 
+from ..corrections import CorrectionPrior
+
 
 @dataclass(slots=True)
 class LossWeights:
     profile_qc: float = 1.0
     point_qc: float = 1.0
     nuisance: float = 0.2
+    nuisance_prior_kl: float = 0.02
+    nuisance_prior: CorrectionPrior = field(default_factory=CorrectionPrior.default)
     reconstruction: float = 1.0
     uncertainty: float = 0.02
 
@@ -72,6 +76,15 @@ if torch is not None:
             total = total + weights.nuisance * loss
             logs["nuisance"] = float(loss.detach().cpu())
 
+        if weights.nuisance_prior_kl > 0 and "nuisance_mean" in outputs:
+            kl = gaussian_diag_kl_to_full_prior(
+                outputs["nuisance_mean"],
+                outputs["nuisance_log_std"],
+                weights.nuisance_prior,
+            )
+            total = total + weights.nuisance_prior_kl * kl
+            logs["nuisance_prior_kl"] = float(kl.detach().cpu())
+
         recon_truth = batch.get("recon_truth")
         if recon_truth is not None:
             target = recon_truth.to(device)
@@ -93,6 +106,26 @@ if torch is not None:
     def gaussian_nll(target: torch.Tensor, mean: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
         var = torch.exp(2.0 * log_std).clamp_min(1e-10)
         return torch.mean(0.5 * ((target - mean) ** 2 / var + torch.log(var)))
+
+
+    def gaussian_diag_kl_to_full_prior(
+        mean_q: torch.Tensor,
+        log_std_q: torch.Tensor,
+        prior: CorrectionPrior,
+    ) -> torch.Tensor:
+        prior_mean = torch.as_tensor(prior.mean, dtype=mean_q.dtype, device=mean_q.device)
+        prior_cov = torch.as_tensor(prior.covariance, dtype=mean_q.dtype, device=mean_q.device)
+        prior_prec = torch.linalg.inv(prior_cov)
+        prior_logdet = torch.logdet(prior_cov)
+
+        diff = mean_q - prior_mean
+        var_q = torch.exp(2.0 * log_std_q).clamp_min(1e-10)
+        trace_term = torch.sum(var_q * torch.diagonal(prior_prec), dim=-1)
+        quad_term = torch.einsum("bi,ij,bj->b", diff, prior_prec, diff)
+        logdet_q = torch.sum(2.0 * log_std_q, dim=-1)
+        k = float(mean_q.shape[-1])
+        kl = 0.5 * (trace_term + quad_term - k + prior_logdet - logdet_q)
+        return torch.mean(torch.clamp(kl, min=0.0))
 
 
     def train_epoch(
@@ -160,6 +193,7 @@ if torch is not None:
         train_loader: Any,
         val_loader: Any | None = None,
         *,
+        eval_label: str = "val",
         device: str | torch.device = "cpu",
         weights: LossWeights | None = None,
         grad_clip: float | None = 1.0,
@@ -193,7 +227,8 @@ if torch is not None:
                     device=device,
                     weights=weights,
                 )
-                val_logs = {f"val_{key}": value for key, value in val_logs.items()}
+                label = str(eval_label).strip() or "val"
+                val_logs = {f"{label}_{key}": value for key, value in val_logs.items()}
                 val_logs["epoch"] = float(epoch)
                 history.append(val_logs)
 

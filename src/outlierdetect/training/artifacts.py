@@ -14,8 +14,9 @@ import uuid
 
 import numpy as np
 
+from outlierdetect.corrections import CorrectionPrior, estimate_correction_posterior
 from outlierdetect.data import NormalizationStats, probability_payload
-from outlierdetect.density import sigma0_from_ts
+from outlierdetect.density import profile_location_from_attrs, sigma0_from_ts
 
 from .dataset import ProfileDataset, ProfileExample, collate_profiles
 
@@ -74,10 +75,13 @@ class TrainingRunWriter:
         device: str | Any = "cpu",
         n_train_examples: int | None = None,
         n_val_examples: int | None = None,
+        eval_label: str = "val",
     ) -> dict[str, Any]:
         """Write progress JSON and 10 sampled reconstruction plots for one epoch."""
         if torch is None:  # pragma: no cover - guarded by training dependency
             raise ImportError("Writing training plots requires PyTorch.")
+
+        eval_label = str(eval_label).strip() or "val"
 
         epoch_dir = self.plots_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
@@ -111,19 +115,37 @@ class TrainingRunWriter:
                 point_bad_t = point_probs[:, 0]
                 point_bad_s = point_probs[:, 1]
                 point_density = point_probs[:, 2] if point_probs.shape[1] > 2 else None
+                point_outlier_probability = self._point_outlier_probability(
+                    point_bad_t,
+                    point_bad_s,
+                    point_density,
+                )
+                point_density_weight = (
+                    np.zeros_like(point_bad_t) if point_density is None else np.asarray(point_density, dtype=float)
+                )
+                correction_post = estimate_correction_posterior(
+                    example.profile,
+                    CorrectionPrior.default(),
+                    point_weights_t=1.0 - np.maximum(point_bad_t, point_density_weight),
+                    point_weights_s=1.0 - np.maximum(point_bad_s, point_density_weight),
+                )
                 recon_temperature, recon_salinity = self._denormalize_reconstruction(
                     outputs["recon_mean"][0].detach().cpu().numpy()
                 )
+                lon, lat = profile_location_from_attrs(example.profile.attrs)
                 self._save_reconstruction_plot(
                     plot_path,
                     profile_id=output_profile_id,
                     pressure=example.profile.pressure,
                     temperature=example.profile.temperature,
                     salinity=example.profile.salinity,
+                    point_outlier_probability=point_outlier_probability,
                     recon_temperature=recon_temperature,
                     recon_salinity=recon_salinity,
                     truth_temperature=self._extract_truth(sample, "truth_t"),
                     truth_salinity=self._extract_truth(sample, "truth_s"),
+                    lon=lon,
+                    lat=lat,
                     epoch=epoch,
                     rank=rank,
                 )
@@ -140,6 +162,8 @@ class TrainingRunWriter:
                     epoch=epoch,
                     rank=rank,
                 )
+                prediction_payload["nuisance_bias"] = correction_post.as_nuisance_bias().as_dict()
+                prediction_payload["correction_posterior"] = correction_post.as_dict()
                 self._write_json(prediction_path, prediction_payload)
                 plot_files.append(plot_rel)
                 selected_profile_ids.append(output_profile_id)
@@ -149,6 +173,9 @@ class TrainingRunWriter:
                         "plot_file": plot_rel,
                         "prediction_file": prediction_rel,
                         "profile_bad_probability": profile_prob,
+                        "correction_status": correction_post.status,
+                        "correction_prior_tension": float(correction_post.prior_tension),
+                        "correction_information_gain": float(correction_post.information_gain),
                     }
                 )
         finally:
@@ -164,6 +191,7 @@ class TrainingRunWriter:
                 "current_epoch": int(epoch),
                 "epochs": epochs,
                 "latest": current,
+                "eval_label": eval_label,
                 "plot_files": plot_files,
                 "selected_profile_ids": selected_profile_ids,
                 "selected_profiles": selected_profiles,
@@ -172,7 +200,10 @@ class TrainingRunWriter:
         if n_train_examples is not None:
             self._progress["n_train_examples"] = int(n_train_examples)
         if n_val_examples is not None:
-            self._progress["n_val_examples"] = int(n_val_examples)
+            self._progress["n_eval_examples"] = int(n_val_examples)
+            self._progress[f"n_{eval_label}_examples"] = int(n_val_examples)
+            if eval_label == "val":
+                self._progress["n_val_examples"] = int(n_val_examples)
 
         self._write_progress()
         return dict(self._progress)
@@ -237,6 +268,9 @@ class TrainingRunWriter:
                     continue
 
                 payload = result.probability_dict()
+                payload["nuisance_bias"] = result.nuisance_bias.as_dict()
+                if result.correction_posterior is not None:
+                    payload["correction_posterior"] = result.correction_posterior.as_dict()
                 if profile.attrs:
                     payload["attrs"] = dict(profile.attrs)
                 self._write_json(prediction_path, payload)
@@ -252,16 +286,25 @@ class TrainingRunWriter:
                 )
                 if result.temperature_reconstructed is None or result.salinity_reconstructed is None:
                     raise ValueError("predict() must return reconstructed temperature and salinity to save plots.")
+                point_outlier_probability = self._point_outlier_probability(
+                    result.point_bad_t,
+                    result.point_bad_s,
+                    result.point_density_inconsistent,
+                )
+                lon, lat = profile_location_from_attrs(profile.attrs)
                 self._save_reconstruction_plot(
                     plot_path,
                     profile_id=profile_id,
                     pressure=profile.pressure,
                     temperature=profile.temperature,
                     salinity=profile.salinity,
+                    point_outlier_probability=point_outlier_probability,
                     recon_temperature=result.temperature_reconstructed,
                     recon_salinity=result.salinity_reconstructed,
                     truth_temperature=None,
                     truth_salinity=None,
+                    lon=lon,
+                    lat=lat,
                     epoch=0,
                     rank=rank,
                 )
@@ -306,6 +349,22 @@ class TrainingRunWriter:
         base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "profile"
         return f"{rank:02d}_{base}.png"
 
+    @staticmethod
+    def _point_outlier_probability(
+        point_bad_t: np.ndarray,
+        point_bad_s: np.ndarray,
+        point_density_inconsistent: np.ndarray | None = None,
+    ) -> np.ndarray:
+        arrays = [
+            np.asarray(point_bad_t, dtype=float),
+            np.asarray(point_bad_s, dtype=float),
+        ]
+        if point_density_inconsistent is not None:
+            arrays.append(np.asarray(point_density_inconsistent, dtype=float))
+        if len({arr.shape for arr in arrays}) != 1:
+            raise ValueError("Point probability arrays must all have the same shape.")
+        return np.clip(np.maximum.reduce(arrays), 0.0, 1.0)
+
     def _save_reconstruction_plot(
         self,
         path: Path,
@@ -314,12 +373,15 @@ class TrainingRunWriter:
         pressure: np.ndarray,
         temperature: np.ndarray,
         salinity: np.ndarray,
+        point_outlier_probability: np.ndarray | None = None,
         recon_temperature: np.ndarray,
         recon_salinity: np.ndarray,
         truth_temperature: np.ndarray | None,
         truth_salinity: np.ndarray | None,
         epoch: int,
         rank: int,
+        lon: float = 0.0,
+        lat: float = 0.0,
     ) -> None:
         try:
             import matplotlib.pyplot as plt
@@ -342,13 +404,49 @@ class TrainingRunWriter:
         s_grid = np.linspace(s_min - s_pad, s_max + s_pad, 120)
         t_grid = np.linspace(t_min - t_pad, t_max + t_pad, 120)
         s_mesh, t_mesh = np.meshgrid(s_grid, t_grid)
-        rho_mesh = sigma0_from_ts(s_mesh, t_mesh)
+        rho_mesh = sigma0_from_ts(s_mesh, t_mesh, lon=lon, lat=lat)
         levels = np.linspace(float(np.nanmin(rho_mesh)), float(np.nanmax(rho_mesh)), 10)
 
         fig, ax = plt.subplots(figsize=(5.8, 5.2), constrained_layout=True)
         contours = ax.contour(s_mesh, t_mesh, rho_mesh, levels=levels, colors="0.84", linewidths=0.8)
         ax.clabel(contours, inline=True, fontsize=7, fmt="%.1f")
-        ax.plot(salinity, temperature, color="#1f77b4", marker="o", ms=3.5, lw=1.4, label="input")
+        input_density = None
+        if point_outlier_probability is not None:
+            input_density = np.asarray(point_outlier_probability, dtype=float)
+            if input_density.shape != salinity.shape:
+                raise ValueError(
+                    "point_outlier_probability must have the same shape as salinity and temperature."
+                )
+
+        input_mask = np.isfinite(salinity) & np.isfinite(temperature)
+        if input_density is not None:
+            input_mask &= np.isfinite(input_density)
+
+        if input_density is None or not np.any(input_mask):
+            ax.plot(salinity, temperature, color="#1f77b4", marker="o", ms=3.5, lw=1.4, label="input")
+        else:
+            ax.plot(
+                salinity[input_mask],
+                temperature[input_mask],
+                color="0.72",
+                lw=0.9,
+                alpha=0.8,
+                zorder=1,
+            )
+            input_points = ax.scatter(
+                salinity[input_mask],
+                temperature[input_mask],
+                c=np.clip(input_density[input_mask], 0.0, 1.0),
+                cmap="magma",
+                vmin=0.0,
+                vmax=1.0,
+                s=20,
+                edgecolors="none",
+                label="input",
+                zorder=2,
+            )
+            colorbar = fig.colorbar(input_points, ax=ax, pad=0.02)
+            colorbar.set_label("point_outlier_probability")
         if truth_temperature is not None and truth_salinity is not None:
             ax.plot(
                 truth_salinity,
@@ -416,12 +514,12 @@ def _group_history(history: list[dict[str, float]]) -> list[dict[str, Any]]:
     for entry in history:
         epoch = int(entry.get("epoch", len(grouped) + 1))
         record = grouped.setdefault(epoch, {"epoch": epoch})
-        train_metrics = {k.removeprefix("train_"): float(v) for k, v in entry.items() if k.startswith("train_")}
-        val_metrics = {k.removeprefix("val_"): float(v) for k, v in entry.items() if k.startswith("val_")}
-        if train_metrics:
-            record["train"] = train_metrics
-        if val_metrics:
-            record["val"] = val_metrics
+        for key, value in entry.items():
+            if "_" not in key:
+                continue
+            prefix, metric = key.split("_", 1)
+            group = record.setdefault(prefix, {})
+            group[metric] = float(value)
     return [grouped[key] for key in sorted(grouped)]
 
 

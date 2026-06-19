@@ -12,12 +12,11 @@ from dataclasses import dataclass
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-import numpy as np
-
-from outlierdetect.argo import ArgoProfile, iter_argo_files, sample_pressure_indices
+from outlierdetect.argo import ArgoProfile, iter_argo_files
 from outlierdetect.parquet import iter_argo_parquet_profiles
+from outlierdetect.training.builders import build_synthetic_examples_from_profiles
 from outlierdetect.training.dataset import ProfileDataset, ProfileExample
-from outlierdetect.training.synthetic import SyntheticExample, degrade_highres_profile
+from outlierdetect.training.synthetic import SyntheticExample
 
 
 @dataclass(slots=True)
@@ -46,6 +45,7 @@ def build_argo_synthetic_examples(
     good_qc_only: bool = True,
     seed: int | None = None,
     upper_ocean_bias: float = 1.7,
+    use_raw_values: bool = False,
 ) -> list[SyntheticExample]:
     """Convert Argo profiles into synthetic training examples.
 
@@ -66,6 +66,8 @@ def build_argo_synthetic_examples(
         Minimum number of finite source levels required from the clean profile.
     good_qc_only:
         Forwarded to the Argo reader when ``root`` is a path.
+    use_raw_values:
+        If True, read raw ``TEMP``/``PSAL`` values and skip QC masking.
     seed:
         Seed for deterministic synthetic corruption.
     upper_ocean_bias:
@@ -79,9 +81,6 @@ def build_argo_synthetic_examples(
     pressure grid used to align the observed values across profiles.
     """
 
-    rng = np.random.default_rng(seed)
-    examples: list[SyntheticExample] = []
-
     profiles: Iterable[ArgoProfile]
     if isinstance(root, Sequence) and not isinstance(root, (str, bytes, Path)):
         if len(root) == 0:
@@ -91,64 +90,29 @@ def build_argo_synthetic_examples(
         else:
             raise TypeError("root sequences must contain ArgoProfile objects.")
     else:
+        effective_good_qc_only = good_qc_only and not use_raw_values
         root_path = Path(root)
         if root_path.suffix.lower() in {".parquet", ".pq"}:
             profiles = iter_argo_parquet_profiles(root_path, min_levels=min_levels)
         else:
             profiles = iter_argo_files(
                 root,
-                good_qc_only=good_qc_only,
+                good_qc_only=effective_good_qc_only,
                 min_levels=min_levels,
+                use_raw_values=use_raw_values,
             )
-
-    for profile_index, profile in enumerate(profiles):
-        if profile_limit is not None and profile_index >= profile_limit:
-            break
-
-        if profile.n_levels < max(min_levels, 5):
-            continue
-
-        day_of_year = None
-        if profile.juld is not None and np.isfinite(profile.juld):
-            day_of_year = float(np.mod(profile.juld, 365.2425))
-
-        for _ in range(max(int(n_examples_per_profile), 1)):
-            child_seed = int(rng.integers(0, 2**32 - 1))
-            child_rng = np.random.default_rng(child_seed)
-            indices = sample_pressure_indices(
-                profile.pressure,
-                n_levels=n_levels,
-                rng=child_rng,
-                upper_ocean_bias=upper_ocean_bias,
-            )
-            pressure_levels = profile.pressure[indices]
-            try:
-                synth = degrade_highres_profile(
-                    profile.pressure,
-                    profile.temperature,
-                    profile.salinity,
-                    rng=child_rng,
-                    pressure_levels=pressure_levels,
-                    grid_size=grid_size,
-                    day_of_year=day_of_year,
-                    profile_id=profile.profile_id,
-                )
-            except ValueError:
-                # Some source profiles still become unusable after cleaning. Skip them
-                # rather than aborting the whole training run.
-                continue
-            synth.example.profile.attrs.update(
-                {
-                    "source": "argo",
-                    "argo_profile_id": profile.profile_id,
-                    "float_wmo": profile.float_wmo,
-                    "cycle_number": profile.cycle_number,
-                    "juld": profile.juld,
-                }
-            )
-            examples.append(synth)
-
-    return examples
+    return build_synthetic_examples_from_profiles(
+        profiles,
+        source_name="argo",
+        source_profile_id_attr="argo_profile_id",
+        n_examples_per_profile=n_examples_per_profile,
+        n_levels=n_levels,
+        grid_size=grid_size,
+        profile_limit=profile_limit,
+        min_levels=min_levels,
+        seed=seed,
+        upper_ocean_bias=upper_ocean_bias,
+    )
 
 
 def build_argo_examples(

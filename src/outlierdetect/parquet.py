@@ -150,6 +150,8 @@ def iter_argo_parquet_profiles(
     - ``float_wmo``
     - ``cycle_number``
     - ``juld``
+    - ``latitude``
+    - ``longitude``
     - ``n_levels``
     - ``level_index``
     - ``pressure``
@@ -206,6 +208,8 @@ def iter_argo_parquet_profiles(
         float_wmo = _parquet_first_value(ordered, "float_wmo")
         cycle_number = _parquet_optional_int(ordered, "cycle_number")
         juld = _parquet_optional_float(ordered, "juld")
+        latitude = _parquet_optional_float(ordered, "latitude")
+        longitude = _parquet_optional_float(ordered, "longitude")
 
         profiles.append(
             ArgoProfile(
@@ -216,6 +220,8 @@ def iter_argo_parquet_profiles(
                 cycle_number=cycle_number,
                 float_wmo=float_wmo,
                 juld=juld,
+                latitude=latitude,
+                longitude=longitude,
             )
         )
 
@@ -235,6 +241,8 @@ def _profile_to_rows(profile: ArgoProfile, source_file: Path, profile_index: int
                 "float_wmo": profile.float_wmo,
                 "cycle_number": profile.cycle_number,
                 "juld": profile.juld,
+                "latitude": profile.latitude,
+                "longitude": profile.longitude,
                 "n_levels": n_levels,
                 "level_index": level_index,
                 "pressure": float(profile.pressure[level_index]),

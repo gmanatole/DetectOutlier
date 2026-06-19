@@ -52,6 +52,8 @@ def degrade_highres_profile(
     pressure_error_probability: float = 0.03,
     global_bad_probability: float = 0.04,
     large_bias_probability: float = 0.50,
+    latitude: float | None = None,
+    longitude: float | None = None,
     day_of_year: float | None = None,
     profile_id: str | None = None,
 ) -> SyntheticExample:
@@ -160,11 +162,19 @@ def degrade_highres_profile(
     sigma_t = np.sqrt(obs_noise_t**2 + ref_noise_t**2 + sigma_ocean_t**2 + sigma_heave_t**2)
     sigma_s = np.sqrt(obs_noise_s**2 + ref_noise_s**2 + sigma_ocean_s**2 + sigma_heave_s**2)
 
-    inv = inversion_metrics(p_sparse, t_obs, s_obs)
+    lon = 0.0 if longitude is None or not np.isfinite(longitude) else float(longitude)
+    lat = 0.0 if latitude is None or not np.isfinite(latitude) else float(latitude)
+    inv = inversion_metrics(p_sparse, t_obs, s_obs, lon=lon, lat=lat)
     point_density = (np.asarray(inv["level_inversion_magnitude"], dtype=float) > 0.02).astype(float)
 
     if day_of_year is None:
         day_of_year = float(rng.uniform(0, 365))
+
+    attrs = {"source": "synthetic_degradation"}
+    if latitude is not None and np.isfinite(latitude):
+        attrs["latitude"] = float(latitude)
+    if longitude is not None and np.isfinite(longitude):
+        attrs["longitude"] = float(longitude)
 
     profile = ProfileInput(
         pressure=p_sparse,
@@ -180,7 +190,7 @@ def degrade_highres_profile(
         rho_ts=np.full(n_levels, 0.6, dtype=float),
         day_of_year=day_of_year,
         profile_id=profile_id,
-        attrs={"source": "synthetic_degradation"},
+        attrs=attrs,
     )
 
     grid = np.linspace(p_hr[0], p_hr[-1], grid_size)

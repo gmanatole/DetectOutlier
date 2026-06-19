@@ -1,0 +1,57 @@
+# Default runtime config for OutlierDetect.
+#
+# Use `outlierdetect config init` to write this template to the current directory.
+# Use `outlierdetect config show` to print it to stdout.
+#
+# All paths are resolved relative to this file.
+
+[paths]
+data_root = "data"
+model_checkpoint = "checkpoints/train_dataset_20ep.pt"
+
+[heave]
+# false disables auxiliary heave loading.
+# true uses sigma information already present on the profile.
+# a path loads sigma from a NetCDF file with sigma + latitude/longitude/time.
+source = false
+
+[inputs]
+residual_t = true
+residual_s = true
+sigma_t = true
+sigma_s = true
+sigma_vert = true
+sigma_heave_t = true
+sigma_heave_s = true
+rho_ts = true
+day_of_year = true
+
+[train]
+train_root = "data"
+output = "checkpoints/train_dataset_20ep.pt"
+data_source = "argo"
+run_root = "artifacts/train_runs"
+seed = 4
+n_examples_per_profile = 1
+n_levels = 20
+min_levels = 5
+grid_size = 80
+upper_ocean_bias = 1.7
+epochs = 20
+batch_size = 8
+learning_rate = 0.001
+val_fraction = 0.1
+test_augment = false
+device = "cpu"
+epoch_plot_count = 10
+good_qc_only = true
+
+[predict]
+predict_root = "data"
+checkpoint = "checkpoints/train_dataset_20ep.pt"
+pattern = "**/*.nc"
+min_levels = 5
+good_qc_only = false
+device = "cpu"
+run_root = "artifacts/predict_runs"
+seed = 4

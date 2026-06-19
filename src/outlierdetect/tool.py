@@ -13,8 +13,9 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from .corrections import CorrectionPrior, estimate_correction_posterior
 from .data import NormalizationStats, NuisanceBias, ProfileInput, Result
-from .density import stable_project_salinity_only
+from .density import profile_location_from_attrs, stable_project_salinity_only
 from .features import FeatureBatch, build_level_features
 
 FloatArray = NDArray[np.float64]
@@ -35,6 +36,8 @@ class Config:
     min_reconstruction_points: int = 3
     default_sigma_t: float = 0.5
     default_sigma_s: float = 0.05
+    correction_prior: CorrectionPrior | None = None
+    recompute_correction_with_point_weights: bool = True
 
 
 class Heuristic:
@@ -48,14 +51,45 @@ class Heuristic:
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
 
-    def predict(self, profile: ProfileInput) -> Result:
-        features = build_level_features(profile)
+    def predict(
+        self,
+        profile: ProfileInput,
+        *,
+        correction_prior: CorrectionPrior | None = None,
+    ) -> Result:
+        active_prior = correction_prior or self.config.correction_prior or CorrectionPrior.default()
+        features = build_level_features(profile, correction_prior=active_prior)
+        correction_post = features.diagnostics.get("correction_posterior")
+        lon, lat = profile_location_from_attrs(profile.attrs)
         point_t, point_s, point_rho = self._point_probabilities(features, profile)
-        profile_prob = self._profile_probability(point_t, point_s, point_rho, features)
-        nuisance = self._nuisance_bias(features)
+        if self.config.recompute_correction_with_point_weights:
+            point_weights_t = 1.0 - np.maximum(point_t, point_rho)
+            point_weights_s = 1.0 - np.maximum(point_s, point_rho)
+            correction_post = estimate_correction_posterior(
+                profile,
+                active_prior,
+                point_weights_t=point_weights_t,
+                point_weights_s=point_weights_s,
+                default_sigma_t=self.config.default_sigma_t,
+                default_sigma_s=self.config.default_sigma_s,
+            )
+        profile_prob = self._profile_probability(point_t, point_s, point_rho, features, correction_post)
+        nuisance = (
+            correction_post.as_nuisance_bias()
+            if correction_post is not None
+            else self._nuisance_bias(features)
+        )
 
         if self.config.do_reconstruction:
-            grid, trec, srec, sig_t, sig_s = self._reconstruct(profile, point_t, point_s, point_rho, features)
+            grid, trec, srec, sig_t, sig_s = self._reconstruct(
+                profile,
+                point_t,
+                point_s,
+                point_rho,
+                features,
+                lon=lon,
+                lat=lat,
+            )
         else:
             grid = trec = srec = sig_t = sig_s = None
 
@@ -67,6 +101,13 @@ class Heuristic:
                 "max_abs_detrended_z_t": float(np.nanmax(np.abs(features.column("detrended_z_t")))),
                 "max_abs_detrended_z_s": float(np.nanmax(np.abs(features.column("detrended_z_s")))),
                 "profile_flag_threshold": self.config.profile_flag_threshold,
+                "correction_status": None if correction_post is None else getattr(correction_post, "status", None),
+                "correction_prior_tension": None
+                if correction_post is None
+                else float(getattr(correction_post, "prior_tension", np.nan)),
+                "correction_information_gain": None
+                if correction_post is None
+                else float(getattr(correction_post, "information_gain", np.nan)),
             }
         )
         return Result(
@@ -75,6 +116,7 @@ class Heuristic:
             point_bad_s=point_s,
             point_density_inconsistent=point_rho,
             nuisance_bias=nuisance,
+            correction_posterior=correction_post,
             pressure_grid=grid,
             temperature_reconstructed=trec,
             salinity_reconstructed=srec,
@@ -89,8 +131,8 @@ class Heuristic:
         self, features: FeatureBatch, profile: ProfileInput
     ) -> tuple[FloatArray, FloatArray, FloatArray]:
         c = self.config
-        dz_t = features.column("detrended_z_t")
-        dz_s = features.column("detrended_z_s")
+        dz_t = _feature_or(features, "posterior_debiased_z_t", "detrended_z_t")
+        dz_s = _feature_or(features, "posterior_debiased_z_s", "detrended_z_s")
         sigma_t = np.maximum(features.column("sigma_t"), c.default_sigma_t * 1e-3)
         sigma_s = np.maximum(features.column("sigma_s"), c.default_sigma_s * 1e-3)
         gap = 0.5 * (features.column("gap_above_norm") + features.column("gap_below_norm"))
@@ -136,15 +178,31 @@ class Heuristic:
         point_s: FloatArray,
         point_rho: FloatArray,
         features: FeatureBatch,
+        correction_post: Any | None = None,
     ) -> float:
         frac_bad = float(
             np.mean((point_t > 0.5) | (point_s > 0.5) | (point_rho > 0.5))
         )
         max_point = float(np.nanmax(np.maximum.reduce([point_t, point_s, point_rho])))
-        zt = np.abs(features.column("detrended_z_t"))
-        zs = np.abs(features.column("detrended_z_s"))
+        zt = np.abs(_feature_or(features, "posterior_debiased_z_t", "detrended_z_t"))
+        zs = np.abs(_feature_or(features, "posterior_debiased_z_s", "detrended_z_s"))
         coherent_bad = max(float(np.nanmedian(zt)), float(np.nanmedian(zs)))
-        score = 3.0 * frac_bad + 1.25 * (max_point - 0.7) + 0.35 * (coherent_bad - 2.5) - 1.0
+        prior_tension = 0.0 if correction_post is None else float(getattr(correction_post, "prior_tension", 0.0))
+        unusual_penalty = 0.0
+        if correction_post is not None and getattr(correction_post, "status", None) in {
+            "requires_unusual_correction",
+            "slope_soft_bound_exceeded",
+        }:
+            unusual_penalty = 0.45
+        tension_penalty = 0.08 * max(prior_tension - 9.5, 0.0)
+        score = (
+            3.0 * frac_bad
+            + 1.25 * (max_point - 0.7)
+            + 0.35 * (coherent_bad - 2.5)
+            + tension_penalty
+            + unusual_penalty
+            - 1.0
+        )
         return float(_sigmoid(score))
 
     def _nuisance_bias(self, features: FeatureBatch) -> NuisanceBias:
@@ -171,6 +229,9 @@ class Heuristic:
         point_s: FloatArray,
         point_rho: FloatArray,
         features: FeatureBatch,
+        *,
+        lon: float = 0.0,
+        lat: float = 0.0,
     ) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray, FloatArray]:
         c = self.config
         grid = _pressure_grid(profile, c)
@@ -201,7 +262,7 @@ class Heuristic:
 
         trec = np.interp(grid, p, t)
         srec = np.interp(grid, p, s)
-        trec, srec = stable_project_salinity_only(grid, trec, srec)
+        trec, srec = stable_project_salinity_only(grid, trec, srec, lon=lon, lat=lat)
 
         sigma_t_levels = features.column("sigma_t")[accepted][order]
         sigma_s_levels = features.column("sigma_s")[accepted][order]
@@ -240,13 +301,24 @@ class Neural:
         if device is not None and hasattr(self.model, "to"):
             self.model.to(device)
 
-    def predict(self, profile: ProfileInput) -> Result:
+    def predict(
+        self,
+        profile: ProfileInput,
+        *,
+        correction_prior: CorrectionPrior | None = None,
+    ) -> Result:
         try:
             import torch
         except Exception as exc:  # pragma: no cover
             raise ImportError("Neural requires PyTorch.") from exc
 
-        features = build_level_features(profile, normalization=self.normalization)
+        active_prior = correction_prior or self.config.correction_prior or CorrectionPrior.default()
+        features = build_level_features(
+            profile,
+            normalization=self.normalization,
+            correction_prior=active_prior,
+        )
+        lon, lat = profile_location_from_attrs(profile.attrs)
         x = torch.as_tensor(features.level_features[None, :, :], dtype=torch.float32)
         mask = torch.as_tensor(features.mask[None, :], dtype=torch.bool)
         grid = _pressure_grid(profile, self.config)
@@ -275,35 +347,46 @@ class Neural:
                     recon_std[:, 1] * self.normalization.salinity_scale,
                 ]
             )
-        trec, srec = stable_project_salinity_only(grid, trec, srec)
-        nuisance = NuisanceBias(
-            a_t=float(nuisance_mean[0]),
-            b_t=float(nuisance_mean[1]),
-            a_s=float(nuisance_mean[2]),
-            b_s=float(nuisance_mean[3]),
-            uncertainty={
-                "a_t": float(np.exp(nuisance_log_std[0])),
-                "b_t": float(np.exp(nuisance_log_std[1])),
-                "a_s": float(np.exp(nuisance_log_std[2])),
-                "b_s": float(np.exp(nuisance_log_std[3])),
-                "note": "Neural local nuisance fit only; not a final tag adjustment.",
-            },
+        trec, srec = stable_project_salinity_only(grid, trec, srec, lon=lon, lat=lat)
+        correction_post = estimate_correction_posterior(
+            profile,
+            active_prior,
+            point_weights_t=1.0 - np.maximum(point[:, 0], point[:, 2]),
+            point_weights_s=1.0 - np.maximum(point[:, 1], point[:, 2]),
+            default_sigma_t=self.config.default_sigma_t,
+            default_sigma_s=self.config.default_sigma_s,
         )
+        nuisance = correction_post.as_nuisance_bias()
         return Result(
             profile_bad_probability=profile_prob,
             point_bad_t=point[:, 0],
             point_bad_s=point[:, 1],
             point_density_inconsistent=point[:, 2],
             nuisance_bias=nuisance,
+            correction_posterior=correction_post,
             pressure_grid=grid,
             temperature_reconstructed=trec,
             salinity_reconstructed=srec,
             sigma_temperature=recon_std[:, 0],
             sigma_salinity=recon_std[:, 1],
             feature_names=features.feature_names,
-            diagnostics={"method": "neural", "feature_version": features.diagnostics.get("feature_version")},
+            diagnostics={
+                "method": "neural",
+                "feature_version": features.diagnostics.get("feature_version"),
+                "nuisance_head_mean": nuisance_mean,
+                "nuisance_head_std": np.exp(nuisance_log_std),
+                "correction_status": getattr(correction_post, "status", None),
+                "correction_prior_tension": float(getattr(correction_post, "prior_tension", np.nan)),
+                "correction_information_gain": float(getattr(correction_post, "information_gain", np.nan)),
+            },
             profile_id=profile.profile_id,
         )
+
+
+def _feature_or(features: FeatureBatch, preferred: str, fallback: str) -> FloatArray:
+    if preferred in features.feature_names:
+        return features.column(preferred)
+    return features.column(fallback)
 
 def _sigmoid(x: FloatArray | float) -> FloatArray | float:
     return 1.0 / (1.0 + np.exp(-np.asarray(x)))
