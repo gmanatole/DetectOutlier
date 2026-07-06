@@ -29,6 +29,6 @@ The starter file includes:
 - toggles for residuals and uncertainty inputs,
 - the training defaults used by the current pipeline, including the clean-profile source,
 - the prediction defaults used by the current pipeline,
-- the heave-source switch.
+- the sigma-vert source used to support reference-backed heave lookup.
 
 The template is intentionally conservative. It is designed to be a readable starting point rather than a hidden source of truth. The actual defaults still live in the code, and any TOML file can override them.

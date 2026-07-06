@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 
@@ -22,17 +23,37 @@ def build_synthetic_examples_from_profiles(
     min_levels: int = 5,
     seed: int | None = None,
     upper_ocean_bias: float = 1.7,
+    reference_source: bool | str | Path | None = None,
 ) -> list[SyntheticExample]:
-    """Convert clean profiles into synthetic training examples."""
+    """Convert clean profiles into synthetic training examples.
+
+    When ``profile_limit`` is set, the builder first filters out profiles that
+    do not meet ``min_levels`` and then draws a random subset of the remaining
+    eligible profiles. The cap is therefore applied after QC/min-level
+    filtering rather than to the raw input order.
+    """
 
     rng = np.random.default_rng(seed)
     examples: list[SyntheticExample] = []
+    min_levels_required = max(min_levels, 5)
 
-    for profile_index, profile in enumerate(profiles):
-        if profile_limit is not None and profile_index >= profile_limit:
-            break
+    if profile_limit is None:
+        selected_profiles: Iterable[ArgoProfile] = profiles
+    else:
+        eligible_profiles = [profile for profile in profiles if profile.n_levels >= min_levels_required]
+        if not eligible_profiles:
+            return []
+        limit = max(int(profile_limit), 0)
+        if limit == 0:
+            return []
+        if len(eligible_profiles) > limit:
+            selected_indices = np.sort(rng.choice(len(eligible_profiles), size=limit, replace=False))
+            selected_profiles = [eligible_profiles[int(index)] for index in selected_indices]
+        else:
+            selected_profiles = eligible_profiles
 
-        if profile.n_levels < max(min_levels, 5):
+    for profile in selected_profiles:
+        if profile.n_levels < min_levels_required:
             continue
 
         day_of_year = None
@@ -61,6 +82,7 @@ def build_synthetic_examples_from_profiles(
                     longitude=profile.longitude,
                     day_of_year=day_of_year,
                     profile_id=profile.profile_id,
+                    reference_source=reference_source,
                 )
             except ValueError:
                 continue

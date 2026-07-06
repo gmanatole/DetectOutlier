@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import ctypes
+import gc
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,7 @@ import re
 import warnings
 from typing import Any, Sequence
 import uuid
+from ctypes.util import find_library
 
 import numpy as np
 
@@ -391,87 +394,91 @@ class TrainingRunWriter:
                 "Install with: pip install -e '.[train]'"
             ) from exc
 
-        s_arrays = [salinity, recon_salinity]
-        t_arrays = [temperature, recon_temperature]
-        if truth_temperature is not None and truth_salinity is not None:
-            s_arrays.append(truth_salinity)
-            t_arrays.append(truth_temperature)
-
-        s_min, s_max = _finite_limits(*s_arrays)
-        t_min, t_max = _finite_limits(*t_arrays)
-        s_pad = max((s_max - s_min) * 0.1, 0.05)
-        t_pad = max((t_max - t_min) * 0.1, 0.05)
-        s_grid = np.linspace(s_min - s_pad, s_max + s_pad, 120)
-        t_grid = np.linspace(t_min - t_pad, t_max + t_pad, 120)
-        s_mesh, t_mesh = np.meshgrid(s_grid, t_grid)
-        rho_mesh = sigma0_from_ts(s_mesh, t_mesh, lon=lon, lat=lat)
-        levels = np.linspace(float(np.nanmin(rho_mesh)), float(np.nanmax(rho_mesh)), 10)
-
         fig, ax = plt.subplots(figsize=(5.8, 5.2), constrained_layout=True)
-        contours = ax.contour(s_mesh, t_mesh, rho_mesh, levels=levels, colors="0.84", linewidths=0.8)
-        ax.clabel(contours, inline=True, fontsize=7, fmt="%.1f")
-        input_density = None
-        if point_outlier_probability is not None:
-            input_density = np.asarray(point_outlier_probability, dtype=float)
-            if input_density.shape != salinity.shape:
-                raise ValueError(
-                    "point_outlier_probability must have the same shape as salinity and temperature."
+        try:
+            s_arrays = [salinity, recon_salinity]
+            t_arrays = [temperature, recon_temperature]
+            if truth_temperature is not None and truth_salinity is not None:
+                s_arrays.append(truth_salinity)
+                t_arrays.append(truth_temperature)
+
+            s_min, s_max = _finite_limits(*s_arrays)
+            t_min, t_max = _finite_limits(*t_arrays)
+            s_pad = max((s_max - s_min) * 0.1, 0.05)
+            t_pad = max((t_max - t_min) * 0.1, 0.05)
+            s_grid = np.linspace(s_min - s_pad, s_max + s_pad, 120)
+            t_grid = np.linspace(t_min - t_pad, t_max + t_pad, 120)
+            s_mesh, t_mesh = np.meshgrid(s_grid, t_grid)
+            rho_mesh = sigma0_from_ts(s_mesh, t_mesh, lon=lon, lat=lat)
+            levels = np.linspace(float(np.nanmin(rho_mesh)), float(np.nanmax(rho_mesh)), 10)
+
+            contours = ax.contour(s_mesh, t_mesh, rho_mesh, levels=levels, colors="0.84", linewidths=0.8)
+            ax.clabel(contours, inline=True, fontsize=7, fmt="%.1f")
+            input_density = None
+            if point_outlier_probability is not None:
+                input_density = np.asarray(point_outlier_probability, dtype=float)
+                if input_density.shape != salinity.shape:
+                    raise ValueError(
+                        "point_outlier_probability must have the same shape as salinity and temperature."
+                    )
+
+            input_mask = np.isfinite(salinity) & np.isfinite(temperature)
+            if input_density is not None:
+                input_mask &= np.isfinite(input_density)
+
+            if input_density is None or not np.any(input_mask):
+                ax.plot(salinity, temperature, color="#1f77b4", marker="o", ms=3.5, lw=1.4, label="input")
+            else:
+                ax.plot(
+                    salinity[input_mask],
+                    temperature[input_mask],
+                    color="0.72",
+                    lw=0.9,
+                    alpha=0.8,
+                    zorder=1,
                 )
-
-        input_mask = np.isfinite(salinity) & np.isfinite(temperature)
-        if input_density is not None:
-            input_mask &= np.isfinite(input_density)
-
-        if input_density is None or not np.any(input_mask):
-            ax.plot(salinity, temperature, color="#1f77b4", marker="o", ms=3.5, lw=1.4, label="input")
-        else:
+                input_points = ax.scatter(
+                    salinity[input_mask],
+                    temperature[input_mask],
+                    c=np.clip(input_density[input_mask], 0.0, 1.0),
+                    cmap="magma",
+                    vmin=0.0,
+                    vmax=1.0,
+                    s=20,
+                    edgecolors="none",
+                    label="input",
+                    zorder=2,
+                )
+                colorbar = fig.colorbar(input_points, ax=ax, pad=0.02)
+                colorbar.set_label("point_outlier_probability")
+            if truth_temperature is not None and truth_salinity is not None:
+                ax.plot(
+                    truth_salinity,
+                    truth_temperature,
+                    color="0.45",
+                    lw=1.2,
+                    ls="--",
+                    alpha=0.75,
+                    label="truth",
+                )
             ax.plot(
-                salinity[input_mask],
-                temperature[input_mask],
-                color="0.72",
-                lw=0.9,
-                alpha=0.8,
-                zorder=1,
+                recon_salinity,
+                recon_temperature,
+                color="#d62728",
+                marker="o",
+                ms=2.8,
+                lw=1.8,
+                label="reconstruction",
             )
-            input_points = ax.scatter(
-                salinity[input_mask],
-                temperature[input_mask],
-                c=np.clip(input_density[input_mask], 0.0, 1.0),
-                cmap="magma",
-                vmin=0.0,
-                vmax=1.0,
-                s=20,
-                edgecolors="none",
-                label="input",
-                zorder=2,
-            )
-            colorbar = fig.colorbar(input_points, ax=ax, pad=0.02)
-            colorbar.set_label("point_outlier_probability")
-        if truth_temperature is not None and truth_salinity is not None:
-            ax.plot(
-                truth_salinity,
-                truth_temperature,
-                color="0.45",
-                lw=1.2,
-                ls="--",
-                alpha=0.75,
-                label="truth",
-            )
-        ax.plot(
-            recon_salinity,
-            recon_temperature,
-            color="#d62728",
-            marker="o",
-            ms=2.8,
-            lw=1.8,
-            label="reconstruction",
-        )
-        ax.set_xlabel("Salinity")
-        ax.set_ylabel("Temperature")
-        ax.set_title(f"{profile_id or 'profile'} | epoch {epoch:03d} | sample {rank:02d}")
-        ax.legend(frameon=False, loc="best")
-        fig.savefig(path, dpi=self.dpi)
-        plt.close(fig)
+            ax.set_xlabel("Salinity")
+            ax.set_ylabel("Temperature")
+            ax.set_title(f"{profile_id or 'profile'} | epoch {epoch:03d} | sample {rank:02d}")
+            ax.legend(frameon=False, loc="best")
+            fig.savefig(path, dpi=self.dpi)
+        finally:
+            plt.close(fig)
+            gc.collect()
+            _trim_memory()
 
     def _extract_truth(self, sample: dict[str, Any], name: str) -> np.ndarray | None:
         recon = sample.get("recon_truth_physical")
@@ -541,3 +548,24 @@ def _finite_limits(*arrays: np.ndarray) -> tuple[float, float]:
         span = max(abs(lo), 1.0)
         return lo - 0.5 * span, hi + 0.5 * span
     return lo, hi
+
+
+def _trim_memory() -> None:
+    """Return freed heap pages to the OS when libc exposes ``malloc_trim``."""
+
+    if os.name == "nt":
+        return
+    libc_candidates = [find_library("c"), "libc.so.6", "libc.so", None]
+    for candidate in libc_candidates:
+        try:
+            libc = ctypes.CDLL(candidate) if candidate is not None else ctypes.CDLL(None)
+        except Exception:
+            continue
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is None:
+            continue
+        try:
+            malloc_trim(0)
+        except Exception:
+            continue
+        break

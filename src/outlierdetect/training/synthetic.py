@@ -8,11 +8,13 @@ and unstable artifacts while remaining tolerant of large coherent T/S biases.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from numpy.random import Generator
 from numpy.typing import ArrayLike, NDArray
 
+from outlierdetect.climatology import sample_climatology_reference
 from outlierdetect.data import ProfileInput
 from outlierdetect.density import inversion_metrics
 from outlierdetect.features import pressure_normalized
@@ -56,12 +58,13 @@ def degrade_highres_profile(
     longitude: float | None = None,
     day_of_year: float | None = None,
     profile_id: str | None = None,
+    reference_source: bool | str | Path | None = None,
 ) -> SyntheticExample:
     """Create one sparse synthetic CTD-SRDL training example.
 
-    The high-resolution input is treated as truth. The synthetic sparse profile
-    may contain coherent linear-in-pressure T/S biases, isolated bad points,
-    pressure errors, and reference mismatch from vertical heave.
+    The high-resolution input is treated as truth for the synthetic corruption
+    process, but the profile residuals are scored against the ECCO monthly
+    climatology when that reference file is available.
     """
     rng = np.random.default_rng() if rng is None else rng
     p_hr = np.asarray(pressure_hr, dtype=float)
@@ -146,26 +149,6 @@ def degrade_highres_profile(
 
     sigma_vert_value = rng.uniform(*sigma_vert_range)
     sigma_vert = np.full(n_levels, sigma_vert_value, dtype=float)
-    # Reference profile is truth displaced vertically plus reference noise.
-    heave = rng.normal(0.0, sigma_vert_value)
-    p_ref_sample = np.clip(p_sparse + heave, p_hr[0], p_hr[-1])
-    t_ref = np.interp(p_ref_sample, p_hr, t_hr) + rng.normal(0.0, ref_noise_t, n_levels)
-    s_ref = np.interp(p_ref_sample, p_hr, s_hr) + rng.normal(0.0, ref_noise_s, n_levels)
-    residual_t = t_obs - t_ref
-    residual_s = s_obs - s_ref
-
-    # Heave-induced uncertainty based on local truth gradients.
-    dtdp_hr = np.gradient(t_hr, p_hr, edge_order=1)
-    dsdp_hr = np.gradient(s_hr, p_hr, edge_order=1)
-    sigma_heave_t = np.abs(np.interp(p_sparse, p_hr, dtdp_hr)) * sigma_vert_value
-    sigma_heave_s = np.abs(np.interp(p_sparse, p_hr, dsdp_hr)) * sigma_vert_value
-    sigma_t = np.sqrt(obs_noise_t**2 + ref_noise_t**2 + sigma_ocean_t**2 + sigma_heave_t**2)
-    sigma_s = np.sqrt(obs_noise_s**2 + ref_noise_s**2 + sigma_ocean_s**2 + sigma_heave_s**2)
-
-    lon = 0.0 if longitude is None or not np.isfinite(longitude) else float(longitude)
-    lat = 0.0 if latitude is None or not np.isfinite(latitude) else float(latitude)
-    inv = inversion_metrics(p_sparse, t_obs, s_obs, lon=lon, lat=lat)
-    point_density = (np.asarray(inv["level_inversion_magnitude"], dtype=float) > 0.02).astype(float)
 
     if day_of_year is None:
         day_of_year = float(rng.uniform(0, 365))
@@ -175,6 +158,66 @@ def degrade_highres_profile(
         attrs["latitude"] = float(latitude)
     if longitude is not None and np.isfinite(longitude):
         attrs["longitude"] = float(longitude)
+
+    reference_profile = ProfileInput(
+        pressure=p_sparse,
+        temperature=t_obs,
+        salinity=s_obs,
+        sigma_vert=sigma_vert,
+        day_of_year=day_of_year,
+        profile_id=profile_id,
+        attrs={**attrs},
+    )
+    reference_sample = sample_climatology_reference(
+        reference_profile,
+        source=reference_source,
+        sigma_vert=sigma_vert,
+    )
+
+    if reference_sample is not None:
+        t_ref = reference_sample.reference_temperature
+        s_ref = reference_sample.reference_salinity
+        residual_t = reference_sample.reference_residual_t
+        residual_s = reference_sample.reference_residual_s
+        sigma_heave_t = reference_sample.reference_sigma_heave_t
+        sigma_heave_s = reference_sample.reference_sigma_heave_s
+        attrs.update(
+            {
+                "reference_source": str(reference_sample.source_path),
+                "reference_month": int(reference_sample.month),
+                "reference_latitude": float(reference_sample.latitude),
+                "reference_longitude": float(reference_sample.longitude),
+                "reference_latitude_index": int(reference_sample.latitude_index),
+                "reference_longitude_index": int(reference_sample.longitude_index),
+            }
+        )
+    else:
+        # Legacy fallback: use the truth profile displaced vertically and add a small reference perturbation.
+        heave = rng.normal(0.0, sigma_vert_value)
+        p_ref_sample = np.clip(p_sparse + heave, p_hr[0], p_hr[-1])
+        t_ref = np.interp(p_ref_sample, p_hr, t_hr) + rng.normal(0.0, ref_noise_t, n_levels)
+        s_ref = np.interp(p_ref_sample, p_hr, s_hr) + rng.normal(0.0, ref_noise_s, n_levels)
+        residual_t = t_obs - t_ref
+        residual_s = s_obs - s_ref
+
+        # Heave-induced uncertainty based on local truth gradients.
+        dtdp_hr = np.gradient(t_hr, p_hr, edge_order=1)
+        dsdp_hr = np.gradient(s_hr, p_hr, edge_order=1)
+        sigma_heave_t = np.abs(np.interp(p_sparse, p_hr, dtdp_hr)) * sigma_vert_value
+        sigma_heave_s = np.abs(np.interp(p_sparse, p_hr, dsdp_hr)) * sigma_vert_value
+
+    if sigma_heave_t is None:
+        sigma_heave_t = np.zeros(n_levels, dtype=float)
+    if sigma_heave_s is None:
+        sigma_heave_s = np.zeros(n_levels, dtype=float)
+
+    sigma_t = np.sqrt(obs_noise_t**2 + ref_noise_t**2 + sigma_ocean_t**2 + sigma_heave_t**2)
+    sigma_s = np.sqrt(obs_noise_s**2 + ref_noise_s**2 + sigma_ocean_s**2 + sigma_heave_s**2)
+
+    lon = 0.0 if longitude is None or not np.isfinite(longitude) else float(longitude)
+    lat = 0.0 if latitude is None or not np.isfinite(latitude) else float(latitude)
+    inv = inversion_metrics(p_sparse, t_obs, s_obs, lon=lon, lat=lat)
+    point_density = (np.asarray(inv["level_inversion_magnitude"], dtype=float) > 0.02).astype(float)
 
     profile = ProfileInput(
         pressure=p_sparse,
@@ -187,6 +230,12 @@ def degrade_highres_profile(
         sigma_vert=sigma_vert,
         sigma_heave_t=sigma_heave_t,
         sigma_heave_s=sigma_heave_s,
+        reference_temperature=t_ref if reference_sample is not None else None,
+        reference_salinity=s_ref if reference_sample is not None else None,
+        reference_residual_t=residual_t if reference_sample is not None else None,
+        reference_residual_s=residual_s if reference_sample is not None else None,
+        reference_sigma_heave_t=sigma_heave_t if reference_sample is not None else None,
+        reference_sigma_heave_s=sigma_heave_s if reference_sample is not None else None,
         rho_ts=np.full(n_levels, 0.6, dtype=float),
         day_of_year=day_of_year,
         profile_id=profile_id,

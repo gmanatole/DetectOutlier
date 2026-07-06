@@ -15,9 +15,12 @@ import numpy as np
 from .argo import ArgoProfile, GOOD_QC_FLAGS
 from .netcdf_backend import _get_qc, _get_var, _has_var, _open_nc, _profile_meta_value
 
-PRESSURE_CANDIDATES: tuple[str, ...] = ("DEPH_CORRECTED", "PRES", "DEPTH")
-TEMPERATURE_CANDIDATES: tuple[str, ...] = ("POTM_CORRECTED", "TEMP_ADJUSTED", "TEMP")
-SALINITY_CANDIDATES: tuple[str, ...] = ("PSAL_CORRECTED", "PSAL_ADJUSTED", "PSAL")
+PRESSURE_ADJUSTED_CANDIDATES: tuple[str, ...] = ("DEPH_CORRECTED", "PRES_ADJUSTED")
+PRESSURE_RAW_CANDIDATES: tuple[str, ...] = ("PRES", "DEPTH")
+TEMPERATURE_ADJUSTED_CANDIDATES: tuple[str, ...] = ("POTM_CORRECTED", "TEMP_ADJUSTED")
+TEMPERATURE_RAW_CANDIDATES: tuple[str, ...] = ("TEMP",)
+SALINITY_ADJUSTED_CANDIDATES: tuple[str, ...] = ("PSAL_CORRECTED", "PSAL_ADJUSTED")
+SALINITY_RAW_CANDIDATES: tuple[str, ...] = ("PSAL",)
 
 PROFILE_QC_CANDIDATES: tuple[str, ...] = (
     "PROFILE_DEPH_QC",
@@ -33,6 +36,8 @@ def read_en4_file(
     good_qc_only: bool = True,
     good_qc_flags: frozenset[int] = GOOD_QC_FLAGS,
     min_levels: int = 5,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     use_raw_values: bool = False,
 ) -> list[ArgoProfile]:
     """Read all EN4 profiles from a single monthly NetCDF file."""
@@ -46,6 +51,8 @@ def read_en4_file(
             effective_good_qc_only,
             good_qc_flags,
             min_levels,
+            profile_type=profile_type,
+            raw_fallback=raw_fallback,
             use_raw_values=use_raw_values,
         )
         if effective_good_qc_only and not profiles:
@@ -55,6 +62,8 @@ def read_en4_file(
                 False,
                 good_qc_flags,
                 min_levels,
+                profile_type=profile_type,
+                raw_fallback=raw_fallback,
                 use_raw_values=use_raw_values,
             )
     finally:
@@ -70,6 +79,8 @@ def iter_en4_files(
     pattern: str = "**/*.nc",
     good_qc_only: bool = True,
     min_levels: int = 5,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     use_raw_values: bool = False,
 ) -> Iterator[ArgoProfile]:
     """Recursively yield EN4 profiles from all NetCDF files under *root*."""
@@ -85,6 +96,8 @@ def iter_en4_files(
                 nc_path,
                 good_qc_only=good_qc_only,
                 min_levels=min_levels,
+                profile_type=profile_type,
+                raw_fallback=raw_fallback,
                 use_raw_values=use_raw_values,
             ):
                 yield prof
@@ -101,15 +114,20 @@ def _parse_profiles(
     good_qc_flags: frozenset[int],
     min_levels: int,
     *,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     use_raw_values: bool = False,
 ) -> list[ArgoProfile]:
-    pressure_name, pres_raw = _select_required_array(ds, PRESSURE_CANDIDATES, "pressure")
-    if use_raw_values:
-        temp_name, temp_raw = _select_required_array(ds, ("TEMP", "TEMP_ADJUSTED", "POTM_CORRECTED"), "temperature")
-        sal_name, sal_raw = _select_required_array(ds, ("PSAL", "PSAL_ADJUSTED", "PSAL_CORRECTED"), "salinity")
-    else:
-        temp_name, temp_raw = _select_required_array(ds, TEMPERATURE_CANDIDATES, "temperature")
-        sal_name, sal_raw = _select_required_array(ds, SALINITY_CANDIDATES, "salinity")
+    profile_type = _normalize_profile_type(profile_type)
+    source_fields = _source_fields_for_profile_type(
+        profile_type,
+        raw_fallback=raw_fallback,
+        use_raw_values=use_raw_values,
+    )
+
+    pressure_name, pres_raw = _select_required_array(ds, source_fields["pressure"], "pressure")
+    temp_name, temp_raw = _select_required_array(ds, source_fields["temperature"], "temperature")
+    sal_name, sal_raw = _select_required_array(ds, source_fields["salinity"], "salinity")
 
     pres_raw = _ensure_profile_matrix(pres_raw, pressure_name)
     temp_raw = _ensure_profile_matrix(temp_raw, temp_name)
@@ -125,9 +143,13 @@ def _parse_profiles(
     latitudes = _profile_values(ds, "LATITUDE", n_prof)
     longitudes = _profile_values(ds, "LONGITUDE", n_prof)
 
-    pressure_qc = _select_level_qc(ds, _level_qc_candidates(pressure_name), n_prof, n_levels)
-    temp_qc = _select_level_qc(ds, _level_qc_candidates(temp_name), n_prof, n_levels)
-    sal_qc = _select_level_qc(ds, _level_qc_candidates(sal_name), n_prof, n_levels)
+    pressure_qc = None
+    temp_qc = None
+    sal_qc = None
+    if good_qc_only:
+        pressure_qc = _select_level_qc(ds, _level_qc_candidates(pressure_name), n_prof, n_levels)
+        temp_qc = _select_level_qc(ds, _level_qc_candidates(temp_name), n_prof, n_levels)
+        sal_qc = _select_level_qc(ds, _level_qc_candidates(sal_name), n_prof, n_levels)
 
     profiles: list[ArgoProfile] = []
     for k in range(n_prof):
@@ -172,6 +194,40 @@ def _parse_profiles(
     return profiles
 
 
+def _normalize_profile_type(value: str | None) -> str:
+    if value is None:
+        return "adjusted"
+    mode = str(value).strip().lower()
+    if mode not in {"adjusted", "raw"}:
+        raise ValueError("profile_type must be either 'adjusted' or 'raw'.")
+    return mode
+
+
+def _source_fields_for_profile_type(
+    profile_type: str,
+    *,
+    raw_fallback: bool,
+    use_raw_values: bool,
+) -> dict[str, tuple[str, ...]]:
+    if use_raw_values:
+        return {
+            "pressure": PRESSURE_ADJUSTED_CANDIDATES,
+            "temperature": TEMPERATURE_RAW_CANDIDATES,
+            "salinity": SALINITY_RAW_CANDIDATES,
+        }
+    if profile_type == "raw":
+        return {
+            "pressure": PRESSURE_RAW_CANDIDATES,
+            "temperature": TEMPERATURE_RAW_CANDIDATES,
+            "salinity": SALINITY_RAW_CANDIDATES,
+        }
+    return {
+        "pressure": PRESSURE_ADJUSTED_CANDIDATES + (PRESSURE_RAW_CANDIDATES if raw_fallback else ()),
+        "temperature": TEMPERATURE_ADJUSTED_CANDIDATES + (TEMPERATURE_RAW_CANDIDATES if raw_fallback else ()),
+        "salinity": SALINITY_ADJUSTED_CANDIDATES + (SALINITY_RAW_CANDIDATES if raw_fallback else ()),
+    }
+
+
 def _select_required_array(ds, candidates: tuple[str, ...], label: str) -> tuple[str, np.ndarray]:
     errors: list[str] = []
     for name in candidates:
@@ -180,7 +236,6 @@ def _select_required_array(ds, candidates: tuple[str, ...], label: str) -> tuple
                 return name, _get_var(ds, name)
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
-                continue
     if errors:
         raise RuntimeError(
             f"Could not read an EN4 {label} variable from {candidates!r}: " + "; ".join(errors)
@@ -213,20 +268,24 @@ def _profile_values(ds, name: str, n_prof: int) -> list[float | None]:
 def _level_qc_candidates(var_name: str) -> tuple[str, ...]:
     if var_name == "DEPH_CORRECTED":
         return ("DEPH_CORRECTED_QC", "PRES_QC", "DEPTH_QC")
+    if var_name == "PRES_ADJUSTED":
+        return ("PRES_ADJUSTED_QC", "PRES_QC")
+    if var_name == "PRES":
+        return ("PRES_QC", "PRES_ADJUSTED_QC")
+    if var_name == "DEPTH":
+        return ("DEPTH_QC", "PRES_QC")
     if var_name == "POTM_CORRECTED":
         return ("POTM_CORRECTED_QC", "TEMP_ADJUSTED_QC", "TEMP_QC")
-    if var_name == "PSAL_CORRECTED":
-        return ("PSAL_CORRECTED_QC", "PSAL_ADJUSTED_QC", "PSAL_QC")
-    if var_name == "PRES":
-        return ("PRES_QC",)
     if var_name == "TEMP_ADJUSTED":
         return ("TEMP_ADJUSTED_QC", "TEMP_QC")
     if var_name == "TEMP":
-        return ("TEMP_QC",)
+        return ("TEMP_QC", "TEMP_ADJUSTED_QC")
+    if var_name == "PSAL_CORRECTED":
+        return ("PSAL_CORRECTED_QC", "PSAL_ADJUSTED_QC", "PSAL_QC")
     if var_name == "PSAL_ADJUSTED":
         return ("PSAL_ADJUSTED_QC", "PSAL_QC")
     if var_name == "PSAL":
-        return ("PSAL_QC",)
+        return ("PSAL_QC", "PSAL_ADJUSTED_QC")
     return (f"{var_name}_QC",)
 
 
@@ -256,8 +315,6 @@ def _select_level_qc(
             if n_prof == 1 and arr.shape[0] == 1 and arr.shape[1] == n_levels:
                 return arr
             continue
-        if arr.ndim > 2:
-            arr = arr.reshape(n_prof, n_levels, -1)[..., 0]
         return arr
     return None
 

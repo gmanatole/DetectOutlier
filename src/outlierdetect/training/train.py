@@ -289,6 +289,9 @@ if torch is not None:
 
 else:
 
+    def compute_loss(*_: Any, **__: Any) -> Any:  # type: ignore[misc]
+        raise ImportError("Training requires PyTorch. Install with the train extra.")
+
     def loss(*_: Any, **__: Any) -> Any:  # type: ignore[misc]
         raise ImportError("Training requires PyTorch. Install with the train extra.")
 

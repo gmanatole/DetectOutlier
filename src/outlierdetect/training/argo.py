@@ -43,9 +43,12 @@ def build_argo_synthetic_examples(
     profile_limit: int | None = None,
     min_levels: int = 5,
     good_qc_only: bool = True,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     seed: int | None = None,
     upper_ocean_bias: float = 1.7,
     use_raw_values: bool = False,
+    reference_source: bool | str | Path | None = None,
 ) -> list[SyntheticExample]:
     """Convert Argo profiles into synthetic training examples.
 
@@ -61,11 +64,17 @@ def build_argo_synthetic_examples(
     grid_size:
         Number of pressure grid points used for reconstruction targets.
     profile_limit:
-        Optional cap on the number of source profiles to use.
+        Optional cap on the number of source profiles to sample after
+        ``min_levels`` filtering.
     min_levels:
         Minimum number of finite source levels required from the clean profile.
     good_qc_only:
         Forwarded to the Argo reader when ``root`` is a path.
+    profile_type:
+        Select adjusted values when available, or raw values only.
+    raw_fallback:
+        When ``profile_type`` is adjusted, allow raw values if the adjusted
+        field is missing.
     use_raw_values:
         If True, read raw ``TEMP``/``PSAL`` values and skip QC masking.
     seed:
@@ -99,6 +108,8 @@ def build_argo_synthetic_examples(
                 root,
                 good_qc_only=effective_good_qc_only,
                 min_levels=min_levels,
+                profile_type=profile_type,
+                raw_fallback=raw_fallback,
                 use_raw_values=use_raw_values,
             )
     return build_synthetic_examples_from_profiles(
@@ -112,6 +123,7 @@ def build_argo_synthetic_examples(
         min_levels=min_levels,
         seed=seed,
         upper_ocean_bias=upper_ocean_bias,
+        reference_source=reference_source,
     )
 
 

@@ -106,6 +106,8 @@ def read_argo_file(
     good_qc_only: bool = True,
     good_qc_flags: frozenset[int] = GOOD_QC_FLAGS,
     min_levels: int = 5,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     use_raw_values: bool = False,
 ) -> list[ArgoProfile]:
     """Read all profiles from a single Argo NetCDF file.
@@ -119,6 +121,13 @@ def read_argo_file(
         If True (default), set data to NaN where QC flags are not in
         ``good_qc_flags``.  Disabling this passes raw adjusted values through
         without flag-based masking.
+    profile_type:
+        Select ``"adjusted"`` values when available or ``"raw"`` values only.
+        When ``profile_type`` is ``"adjusted"``, ``raw_fallback`` controls
+        whether raw values may be used if the adjusted field is missing.
+    raw_fallback:
+        When ``profile_type`` is ``"adjusted"``, allow raw values as a fallback
+        for fields that are missing in adjusted form.
     use_raw_values:
         If True, read ``TEMP`` and ``PSAL`` directly and skip QC masking.
     good_qc_flags:
@@ -141,6 +150,8 @@ def read_argo_file(
             good_qc_only and not use_raw_values,
             good_qc_flags,
             min_levels,
+            profile_type=profile_type,
+            raw_fallback=raw_fallback,
             use_raw_values=use_raw_values,
         )
     finally:
@@ -158,6 +169,8 @@ def _parse_profiles(
     good_qc_flags: frozenset[int],
     min_levels: int,
     *,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     use_raw_values: bool = False,
 ) -> list[ArgoProfile]:
     """Internal: extract profiles from an open dataset handle."""
@@ -166,13 +179,29 @@ def _parse_profiles(
     # Argo files are either:
     #   (N_PROF, N_LEVELS) – multi-profile "Sprof" or "Rprof"
     #   (N_LEVELS,)        – single-profile mono files
-    pres_raw = _get_var(ds, "PRES")
+    profile_type = _normalize_profile_type(profile_type)
     if use_raw_values:
-        temp_raw = _get_var(ds, "TEMP")
-        psal_raw = _get_var(ds, "PSAL")
+        source_fields = {
+            "pressure": ("PRES",),
+            "temperature": ("TEMP",),
+            "salinity": ("PSAL",),
+        }
+    elif profile_type == "raw":
+        source_fields = {
+            "pressure": ("PRES",),
+            "temperature": ("TEMP",),
+            "salinity": ("PSAL",),
+        }
     else:
-        temp_raw = _get_var(ds, "TEMP_ADJUSTED")
-        psal_raw = _get_var(ds, "PSAL_ADJUSTED")
+        source_fields = {
+            "pressure": ("PRES_ADJUSTED",) + (("PRES",) if raw_fallback else ()),
+            "temperature": ("TEMP_ADJUSTED",) + (("TEMP",) if raw_fallback else ()),
+            "salinity": ("PSAL_ADJUSTED",) + (("PSAL",) if raw_fallback else ()),
+        }
+
+    pres_name, pres_raw = _select_required_array(ds, source_fields["pressure"], "pressure")
+    temp_name, temp_raw = _select_required_array(ds, source_fields["temperature"], "temperature")
+    psal_name, psal_raw = _select_required_array(ds, source_fields["salinity"], "salinity")
 
     two_d = pres_raw.ndim == 2
     if pres_raw.ndim == 1:
@@ -188,9 +217,9 @@ def _parse_profiles(
         temp_qc = None
         psal_qc = None
     else:
-        pres_qc = _get_qc(ds, "PRES_QC")
-        temp_qc = _get_qc(ds, "TEMP_ADJUSTED_QC")
-        psal_qc = _get_qc(ds, "PSAL_ADJUSTED_QC")
+        pres_qc = _select_qc_array(ds, _qc_candidates_for_variable(pres_name))
+        temp_qc = _select_qc_array(ds, _qc_candidates_for_variable(temp_name))
+        psal_qc = _select_qc_array(ds, _qc_candidates_for_variable(psal_name))
 
     if pres_qc is not None and pres_qc.ndim == 1 and two_d:
         pres_qc = pres_qc[np.newaxis, :]
@@ -293,6 +322,56 @@ def _parse_profiles(
     return profiles
 
 
+def _normalize_profile_type(value: str | None) -> str:
+    if value is None:
+        return "adjusted"
+    mode = str(value).strip().lower()
+    if mode not in {"adjusted", "raw"}:
+        raise ValueError("profile_type must be either 'adjusted' or 'raw'.")
+    return mode
+
+
+def _select_required_array(ds, candidates: tuple[str, ...], label: str) -> tuple[str, np.ndarray]:
+    errors: list[str] = []
+    for name in candidates:
+        if _has_var(ds, name):
+            try:
+                return name, _get_var(ds, name)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+    if errors:
+        raise RuntimeError(
+            f"Could not read an Argo {label} variable from {candidates!r}: " + "; ".join(errors)
+        )
+    raise KeyError(f"Could not find an Argo {label} variable in {candidates!r}.")
+
+
+def _qc_candidates_for_variable(var_name: str) -> tuple[str, ...]:
+    if var_name == "PRES_ADJUSTED":
+        return ("PRES_ADJUSTED_QC", "PRES_QC")
+    if var_name == "PRES":
+        return ("PRES_QC", "PRES_ADJUSTED_QC")
+    if var_name == "TEMP_ADJUSTED":
+        return ("TEMP_ADJUSTED_QC", "TEMP_QC")
+    if var_name == "TEMP":
+        return ("TEMP_QC", "TEMP_ADJUSTED_QC")
+    if var_name == "PSAL_ADJUSTED":
+        return ("PSAL_ADJUSTED_QC", "PSAL_QC")
+    if var_name == "PSAL":
+        return ("PSAL_QC", "PSAL_ADJUSTED_QC")
+    return (f"{var_name}_QC",)
+
+
+def _select_qc_array(ds, candidates: tuple[str, ...]) -> np.ndarray | None:
+    for name in candidates:
+        if not _has_var(ds, name):
+            continue
+        qc = _get_qc(ds, name)
+        if qc is not None:
+            return qc
+    return None
+
+
 def _has_var(ds, name: str) -> bool:
     """Return True when *name* is present as a data variable.
 
@@ -332,6 +411,8 @@ def iter_argo_files(
     pattern: str = "**/*.nc",
     good_qc_only: bool = True,
     min_levels: int = 5,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     use_raw_values: bool = False,
 ) -> Iterator[ArgoProfile]:
     """Recursively yield ArgoProfile objects from all .nc files under *root*.
@@ -344,6 +425,10 @@ def iter_argo_files(
         Glob pattern relative to *root* (default: ``**/*.nc``).
     good_qc_only, min_levels:
         Forwarded to :func:`read_argo_file`.
+    profile_type:
+        Passed through to :func:`read_argo_file`.
+    raw_fallback:
+        Passed through to :func:`read_argo_file`.
     use_raw_values:
         If True, prefer raw ``TEMP``/``PSAL`` values and skip QC masking.
 
@@ -364,6 +449,8 @@ def iter_argo_files(
                 nc_path,
                 good_qc_only=good_qc_only,
                 min_levels=min_levels,
+                profile_type=profile_type,
+                raw_fallback=raw_fallback,
                 use_raw_values=use_raw_values,
             ):
                 yield prof

@@ -274,10 +274,10 @@ def estimate_correction_posterior(
         p_ref_dbar = float(np.nanmean(p)) if np.any(np.isfinite(p)) else 0.0
     z = pressure_km_coordinate(p, p_ref_dbar)
 
-    rt = _optional_array(profile.residual_t, n=n)
-    rs = _optional_array(profile.residual_s, n=n)
-    sigma_t = _effective_sigma(profile.sigma_t, profile.sigma_heave_t, default_sigma_t, n)
-    sigma_s = _effective_sigma(profile.sigma_s, profile.sigma_heave_s, default_sigma_s, n)
+    rt = _optional_array(profile.effective_residual_t(), n=n)
+    rs = _optional_array(profile.effective_residual_s(), n=n)
+    sigma_t = _effective_sigma(profile.sigma_t, profile.effective_sigma_heave_t(), default_sigma_t, n)
+    sigma_s = _effective_sigma(profile.sigma_s, profile.effective_sigma_heave_s(), default_sigma_s, n)
     rho = _optional_array(profile.rho_ts, n=n, default=0.0)
     rho = np.clip(np.nan_to_num(rho, nan=0.0), -0.95, 0.95)
     wt = _weights(point_weights_t, n=n, min_weight=min_weight)

@@ -191,8 +191,12 @@ def build_level_features(
     p = profile.pressure.astype(float)
     t_raw = profile.temperature.astype(float)
     s_raw = profile.salinity.astype(float)
-    residual_t_raw = None if profile.residual_t is None else np.asarray(profile.residual_t, dtype=float)
-    residual_s_raw = None if profile.residual_s is None else np.asarray(profile.residual_s, dtype=float)
+    residual_t_source = profile.effective_residual_t()
+    residual_s_source = profile.effective_residual_s()
+    sigma_heave_t_source = profile.effective_sigma_heave_t()
+    sigma_heave_s_source = profile.effective_sigma_heave_s()
+    residual_t_raw = None if residual_t_source is None else np.asarray(residual_t_source, dtype=float)
+    residual_s_raw = None if residual_s_source is None else np.asarray(residual_s_source, dtype=float)
     n = p.size
     mask = np.isfinite(p) & (np.isfinite(t_raw) | np.isfinite(s_raw))
 
@@ -201,23 +205,23 @@ def build_level_features(
         s = s_raw
         residual_t = _nan_default(residual_t_raw, default=0.0, n=n)
         residual_s = _nan_default(residual_s_raw, default=0.0, n=n)
-        sigma_t = _effective_sigma(profile.sigma_t, default=0.5, extra=profile.sigma_heave_t, n=n)
-        sigma_s = _effective_sigma(profile.sigma_s, default=0.05, extra=profile.sigma_heave_s, n=n)
+        sigma_t = _effective_sigma(profile.sigma_t, default=0.5, extra=sigma_heave_t_source, n=n)
+        sigma_s = _effective_sigma(profile.sigma_s, default=0.05, extra=sigma_heave_s_source, n=n)
         sigma_vert = _nan_default(profile.sigma_vert, default=0.0, n=n)
-        sigma_heave_t = _nan_default(profile.sigma_heave_t, default=0.0, n=n)
-        sigma_heave_s = _nan_default(profile.sigma_heave_s, default=0.0, n=n)
+        sigma_heave_t = _nan_default(sigma_heave_t_source, default=0.0, n=n)
+        sigma_heave_s = _nan_default(sigma_heave_s_source, default=0.0, n=n)
     else:
         t = norm.normalize_temperature(t_raw)
         s = norm.normalize_salinity(s_raw)
         residual_t = _nan_default(residual_t_raw, default=0.0, n=n) / norm.temperature_scale
         residual_s = _nan_default(residual_s_raw, default=0.0, n=n) / norm.salinity_scale
-        sigma_t = _effective_sigma(profile.sigma_t, default=0.5, extra=profile.sigma_heave_t, n=n)
+        sigma_t = _effective_sigma(profile.sigma_t, default=0.5, extra=sigma_heave_t_source, n=n)
         sigma_t = sigma_t / norm.temperature_scale
-        sigma_s = _effective_sigma(profile.sigma_s, default=0.05, extra=profile.sigma_heave_s, n=n)
+        sigma_s = _effective_sigma(profile.sigma_s, default=0.05, extra=sigma_heave_s_source, n=n)
         sigma_s = sigma_s / norm.salinity_scale
         sigma_vert = _nan_default(profile.sigma_vert, default=0.0, n=n)
-        sigma_heave_t = _nan_default(profile.sigma_heave_t, default=0.0, n=n) / norm.temperature_scale
-        sigma_heave_s = _nan_default(profile.sigma_heave_s, default=0.0, n=n) / norm.salinity_scale
+        sigma_heave_t = _nan_default(sigma_heave_t_source, default=0.0, n=n) / norm.temperature_scale
+        sigma_heave_s = _nan_default(sigma_heave_s_source, default=0.0, n=n) / norm.salinity_scale
 
     p_norm = pressure_normalized(p)
     gap_above, gap_below = _neighbor_gaps(p)
@@ -239,8 +243,8 @@ def build_level_features(
     inv = inversion_metrics(p, t_raw, s_raw, lon=lon, lat=lat)
     inv_mag = np.asarray(inv["level_inversion_magnitude"], dtype=float)
     rho_ts = np.clip(_nan_default(profile.rho_ts, default=0.0, n=n), -0.999, 0.999)
-    has_residual_t = np.full(n, float(profile.residual_t is not None), dtype=float)
-    has_residual_s = np.full(n, float(profile.residual_s is not None), dtype=float)
+    has_residual_t = np.full(n, float(residual_t_source is not None), dtype=float)
+    has_residual_s = np.full(n, float(residual_s_source is not None), dtype=float)
     has_sigma_t = np.full(n, float(profile.sigma_t is not None), dtype=float)
     has_sigma_s = np.full(n, float(profile.sigma_s is not None), dtype=float)
 

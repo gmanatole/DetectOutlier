@@ -140,6 +140,15 @@ class ProfileInput:
     sigma_heave_t, sigma_heave_s:
         Optional derived uncertainty from vertical heave: |dTref/dp| sigma_p and
         |dSref/dp| sigma_p. These can be supplied without exposing Tref/Sref.
+    reference_temperature, reference_salinity:
+        Optional background climatology values sampled at the profile pressure
+        grid.
+    reference_residual_t, reference_residual_s:
+        Optional climatology-backed residuals. When present, the model prefers
+        these over the legacy residual fields.
+    reference_sigma_heave_t, reference_sigma_heave_s:
+        Optional climatology-backed heave uncertainties. These are preferred by
+        the model when present and not disabled.
     rho_ts:
         Optional local T-S residual correlation coefficient.
     day_of_year:
@@ -160,6 +169,12 @@ class ProfileInput:
     sigma_vert: FloatArray | None = None
     sigma_heave_t: FloatArray | None = None
     sigma_heave_s: FloatArray | None = None
+    reference_temperature: FloatArray | None = None
+    reference_salinity: FloatArray | None = None
+    reference_residual_t: FloatArray | None = None
+    reference_residual_s: FloatArray | None = None
+    reference_sigma_heave_t: FloatArray | None = None
+    reference_sigma_heave_s: FloatArray | None = None
     rho_ts: FloatArray | None = None
     day_of_year: float | None = None
     profile_id: str | None = None
@@ -177,6 +192,12 @@ class ProfileInput:
         self.sigma_vert = _to_1d_float("sigma_vert", self.sigma_vert, n)
         self.sigma_heave_t = _to_1d_float("sigma_heave_t", self.sigma_heave_t, n)
         self.sigma_heave_s = _to_1d_float("sigma_heave_s", self.sigma_heave_s, n)
+        self.reference_temperature = _to_1d_float("reference_temperature", self.reference_temperature, n)
+        self.reference_salinity = _to_1d_float("reference_salinity", self.reference_salinity, n)
+        self.reference_residual_t = _to_1d_float("reference_residual_t", self.reference_residual_t, n)
+        self.reference_residual_s = _to_1d_float("reference_residual_s", self.reference_residual_s, n)
+        self.reference_sigma_heave_t = _to_1d_float("reference_sigma_heave_t", self.reference_sigma_heave_t, n)
+        self.reference_sigma_heave_s = _to_1d_float("reference_sigma_heave_s", self.reference_sigma_heave_s, n)
         self.rho_ts = _to_1d_float("rho_ts", self.rho_ts, n)
         self.validate()
 
@@ -191,6 +212,18 @@ class ProfileInput:
     @property
     def pmin(self) -> float:
         return float(np.nanmin(self.pressure))
+
+    def effective_residual_t(self) -> FloatArray | None:
+        return self._preferred_optional_array(self.reference_residual_t, self.residual_t)
+
+    def effective_residual_s(self) -> FloatArray | None:
+        return self._preferred_optional_array(self.reference_residual_s, self.residual_s)
+
+    def effective_sigma_heave_t(self) -> FloatArray | None:
+        return self._preferred_optional_array(self.reference_sigma_heave_t, self.sigma_heave_t)
+
+    def effective_sigma_heave_s(self) -> FloatArray | None:
+        return self._preferred_optional_array(self.reference_sigma_heave_s, self.sigma_heave_s)
 
     def validate(self) -> None:
         if self.pressure.size < 2:
@@ -226,6 +259,12 @@ class ProfileInput:
             sigma_vert=take(self.sigma_vert),
             sigma_heave_t=take(self.sigma_heave_t),
             sigma_heave_s=take(self.sigma_heave_s),
+            reference_temperature=take(self.reference_temperature),
+            reference_salinity=take(self.reference_salinity),
+            reference_residual_t=take(self.reference_residual_t),
+            reference_residual_s=take(self.reference_residual_s),
+            reference_sigma_heave_t=take(self.reference_sigma_heave_t),
+            reference_sigma_heave_s=take(self.reference_sigma_heave_s),
             rho_ts=take(self.rho_ts),
             day_of_year=self.day_of_year,
             profile_id=self.profile_id,
@@ -249,7 +288,10 @@ class ProfileInput:
             Optional mapping from canonical names to dataframe columns. Canonical
             names are ``pressure``, ``temperature``, ``salinity``, ``residual_t``,
             ``residual_s``, ``sigma_t``, ``sigma_s``, ``sigma_vert``,
-            ``sigma_heave_t``, ``sigma_heave_s``, and ``rho_ts``.
+            ``sigma_heave_t``, ``sigma_heave_s``, ``reference_temperature``,
+            ``reference_salinity``, ``reference_residual_t``,
+            ``reference_residual_s``, ``reference_sigma_heave_t``,
+            ``reference_sigma_heave_s``, and ``rho_ts``.
         kwargs:
             Additional ProfileInput fields, e.g. ``day_of_year`` or ``profile_id``.
         """
@@ -264,6 +306,12 @@ class ProfileInput:
             "sigma_vert": "sigma_vert",
             "sigma_heave_t": "sigma_heave_t",
             "sigma_heave_s": "sigma_heave_s",
+            "reference_temperature": "reference_temperature",
+            "reference_salinity": "reference_salinity",
+            "reference_residual_t": "reference_residual_t",
+            "reference_residual_s": "reference_residual_s",
+            "reference_sigma_heave_t": "reference_sigma_heave_t",
+            "reference_sigma_heave_s": "reference_sigma_heave_s",
             "rho_ts": "rho_ts",
         }
         if columns is not None:
@@ -290,6 +338,12 @@ class ProfileInput:
             "sigma_vert",
             "sigma_heave_t",
             "sigma_heave_s",
+            "reference_temperature",
+            "reference_salinity",
+            "reference_residual_t",
+            "reference_residual_s",
+            "reference_sigma_heave_t",
+            "reference_sigma_heave_s",
             "rho_ts",
         ):
             value = getattr(self, key)
@@ -298,6 +352,14 @@ class ProfileInput:
         out["profile_id"] = self.profile_id
         out["attrs"] = dict(self.attrs)
         return out
+
+    @staticmethod
+    def _preferred_optional_array(primary: FloatArray | None, fallback: FloatArray | None) -> FloatArray | None:
+        if primary is not None and np.any(np.isfinite(primary)):
+            return primary
+        if fallback is not None and np.any(np.isfinite(fallback)):
+            return fallback
+        return None
 
 
 @dataclass(slots=True)

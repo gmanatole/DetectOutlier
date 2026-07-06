@@ -45,7 +45,7 @@ class Heuristic:
 
     This class is intentionally transparent. It is not meant to be the final
     product, but it provides a usable API, test baseline, and reference behavior
-    for the future neural model.
+    for the neural model.
     """
 
     def __init__(self, config: Config | None = None):
@@ -165,9 +165,9 @@ class Heuristic:
         point_rho = np.where(np.isfinite(profile.temperature) & np.isfinite(profile.salinity), point_rho, 1.0)
 
         # If residuals are absent, avoid making the residual score look informative.
-        if profile.residual_t is None:
+        if profile.effective_residual_t() is None:
             point_t = np.maximum(0.05, 0.4 * _sigmoid(rough_t - c.curvature_threshold))
-        if profile.residual_s is None:
+        if profile.effective_residual_s() is None:
             point_s = np.maximum(0.05, 0.4 * _sigmoid(rough_s - c.curvature_threshold))
 
         return point_t.astype(float), point_s.astype(float), point_rho.astype(float)

@@ -2,7 +2,7 @@
 
 The package keeps the model itself small, so the config layer handles the
 larger concerns: path resolution, default TOML loading, input toggles, and the
-optional heave-sigma source used during prediction.
+optional sigma-vert source used to support reference-backed heave lookup.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib  # type: ignore[no-redef]
 
 from .data import ProfileInput
+from .climatology import sample_climatology_reference
 
 DEFAULT_TRAIN_RUN_ROOT = Path(__file__).resolve().parent / "train" / "data" / "run"
 DEFAULT_PREDICT_RUN_ROOT = Path("artifacts") / "predict_runs"
@@ -39,12 +40,15 @@ class PathConfig:
 
 @dataclass(slots=True)
 class HeaveConfig:
-    """Optional vertical-heave source.
+    """Optional vertical-heave sigma source.
 
     ``source`` can be:
-    - ``False`` or ``None``: do not attempt to derive heave from an auxiliary source;
-    - ``True``: use the profile's own sigma/heave metadata when available;
-    - a path to a NetCDF file containing sigma and latitude/longitude/time metadata.
+    - ``False`` or ``None``: do not attempt to derive ``sigma_vert`` from an auxiliary source;
+    - ``True``: use ``sigma_vert`` already present on the profile metadata when available;
+    - a path to a NetCDF file containing ``sigma`` and latitude/longitude/time metadata.
+
+    When the ECCO reference climatology is active, the reference profile is
+    still the source used to derive heave uncertainty.
     """
 
     source: bool | str | Path | None = False
@@ -72,6 +76,8 @@ class TrainConfig:
     train_root: str | Path | None = None
     test_root: str | Path | None = None
     data_source: str = "argo"
+    profile_type: str = "adjusted"
+    raw_fallback: bool = False
     output: str | Path | None = None
     seed: int = 4
     profile_limit: int | None = None
@@ -89,6 +95,7 @@ class TrainConfig:
     epoch_plot_count: int = 10
     good_qc_only: bool = True
     test_augment: bool = False
+    reference: str = "ecco"
 
 
 @dataclass(slots=True)
@@ -100,6 +107,8 @@ class PredictConfig:
     pattern: str = "**/*.nc"
     min_levels: int = 5
     good_qc_only: bool = False
+    profile_type: str = "adjusted"
+    raw_fallback: bool = False
     profile_limit: int | None = None
     device: str = "cpu"
     run_root: str | Path | None = DEFAULT_PREDICT_RUN_ROOT
@@ -162,6 +171,9 @@ def load_app_config(path: str | Path | None = None) -> AppConfig:
     _merge_section(config.predict, predict_values)
     config.source_path = config_path
     _resolve_config_paths(config, base_dir=config_path.parent)
+    config.train.profile_type = _normalize_profile_type(config.train.profile_type)
+    config.predict.profile_type = _normalize_profile_type(config.predict.profile_type)
+    config.train.reference = _normalize_reference_mode(config.train.reference)
     return config
 
 
@@ -207,6 +219,8 @@ def example_app_config() -> AppConfig:
     config.train.train_root = "data"
     config.train.test_root = None
     config.train.data_source = "argo"
+    config.train.profile_type = "adjusted"
+    config.train.raw_fallback = False
     config.train.output = "checkpoints/train_dataset_20ep.pt"
     config.train.seed = 4
     config.train.profile_limit = None
@@ -224,12 +238,15 @@ def example_app_config() -> AppConfig:
     config.train.epoch_plot_count = 10
     config.train.good_qc_only = True
     config.train.test_augment = False
+    config.train.reference = "ecco"
 
     config.predict.predict_root = "data"
     config.predict.checkpoint = "checkpoints/train_dataset_20ep.pt"
     config.predict.pattern = "**/*.nc"
     config.predict.min_levels = 5
     config.predict.good_qc_only = False
+    config.predict.profile_type = "adjusted"
+    config.predict.raw_fallback = False
     config.predict.profile_limit = None
     config.predict.device = "cpu"
     config.predict.run_root = "artifacts/predict_runs"
@@ -293,6 +310,8 @@ def train_parser_defaults(config: AppConfig) -> dict[str, Any]:
         "train_root": _first_path(config.train.train_root, config.paths.data_root),
         "test_root": config.train.test_root,
         "data_source": config.train.data_source,
+        "profile_type": config.train.profile_type,
+        "raw_fallback": config.train.raw_fallback,
         "output": _first_path(config.train.output, config.paths.model_checkpoint),
         "seed": config.train.seed,
         "profile_limit": config.train.profile_limit,
@@ -331,6 +350,8 @@ def predict_parser_defaults(config: AppConfig) -> dict[str, Any]:
         "pattern": config.predict.pattern,
         "min_levels": config.predict.min_levels,
         "good_qc_only": config.predict.good_qc_only,
+        "profile_type": config.predict.profile_type,
+        "raw_fallback": config.predict.raw_fallback,
         "profile_limit": config.predict.profile_limit,
         "device": config.predict.device,
         "run_root": _first_path(config.predict.run_root, config.paths.predict_run_root, DEFAULT_PREDICT_RUN_ROOT),
@@ -361,6 +382,7 @@ def resolve_profile_input(
     use_rho_ts: bool = True,
     use_day_of_year: bool = True,
     sigma_heave_source: bool | str | Path | None = False,
+    reference_source: bool | str | Path | None = None,
 ) -> ProfileInput:
     """Return a profile with optional fields enabled/disabled per config."""
     attrs = dict(profile.attrs)
@@ -370,26 +392,68 @@ def resolve_profile_input(
     elif sigma_heave_source is True and sigma_vert is None:
         sigma_vert = _extract_sigma_from_attrs(profile)
 
-    sigma_heave_t = profile.sigma_heave_t
-    sigma_heave_s = profile.sigma_heave_s
-    if sigma_vert is not None and (sigma_heave_t is None or sigma_heave_s is None):
-        computed_t, computed_s = _compute_sigma_heave(profile, sigma_vert)
-        if sigma_heave_t is None:
-            sigma_heave_t = computed_t
-        if sigma_heave_s is None:
-            sigma_heave_s = computed_s
+    sigma_heave_t = profile.sigma_heave_t if use_sigma_heave_t else None
+    sigma_heave_s = profile.sigma_heave_s if use_sigma_heave_s else None
+
+    reference_request = reference_source
+    if reference_request is None:
+        reference_request = attrs.get("reference_source")
+    reference_sample = sample_climatology_reference(profile, source=reference_request, sigma_vert=sigma_vert)
+    if reference_sample is not None:
+        attrs.update(
+            {
+                "reference_source": str(reference_sample.source_path),
+                "reference_month": int(reference_sample.month),
+                "reference_latitude": float(reference_sample.latitude),
+                "reference_longitude": float(reference_sample.longitude),
+                "reference_latitude_index": int(reference_sample.latitude_index),
+                "reference_longitude_index": int(reference_sample.longitude_index),
+            }
+        )
+
+    residual_t = profile.residual_t if use_residual_t else None
+    residual_s = profile.residual_s if use_residual_s else None
+    reference_residual_t = None
+    reference_residual_s = None
+    reference_temperature = None
+    reference_salinity = None
+    reference_sigma_heave_t = None
+    reference_sigma_heave_s = None
+    if reference_sample is not None:
+        reference_temperature = reference_sample.reference_temperature
+        reference_salinity = reference_sample.reference_salinity
+        if use_residual_t:
+            residual_t = reference_sample.reference_residual_t
+            reference_residual_t = reference_sample.reference_residual_t
+        if use_residual_s:
+            residual_s = reference_sample.reference_residual_s
+            reference_residual_s = reference_sample.reference_residual_s
+        if use_sigma_heave_t:
+            if reference_sample.reference_sigma_heave_t is not None:
+                sigma_heave_t = reference_sample.reference_sigma_heave_t
+            reference_sigma_heave_t = reference_sample.reference_sigma_heave_t
+        if use_sigma_heave_s:
+            if reference_sample.reference_sigma_heave_s is not None:
+                sigma_heave_s = reference_sample.reference_sigma_heave_s
+            reference_sigma_heave_s = reference_sample.reference_sigma_heave_s
 
     return ProfileInput(
         pressure=profile.pressure,
         temperature=profile.temperature,
         salinity=profile.salinity,
-        residual_t=profile.residual_t if use_residual_t else None,
-        residual_s=profile.residual_s if use_residual_s else None,
+        residual_t=residual_t,
+        residual_s=residual_s,
         sigma_t=profile.sigma_t if use_sigma_t else None,
         sigma_s=profile.sigma_s if use_sigma_s else None,
         sigma_vert=sigma_vert if use_sigma_vert else None,
         sigma_heave_t=sigma_heave_t if use_sigma_heave_t else None,
         sigma_heave_s=sigma_heave_s if use_sigma_heave_s else None,
+        reference_temperature=reference_temperature,
+        reference_salinity=reference_salinity,
+        reference_residual_t=reference_residual_t,
+        reference_residual_s=reference_residual_s,
+        reference_sigma_heave_t=reference_sigma_heave_t,
+        reference_sigma_heave_s=reference_sigma_heave_s,
         rho_ts=profile.rho_ts if use_rho_ts else None,
         day_of_year=profile.day_of_year if use_day_of_year else None,
         profile_id=profile.profile_id,
@@ -441,6 +505,16 @@ def _resolve_config_paths(config: AppConfig, *, base_dir: Path) -> None:
     config.heave.source = _resolve_heave_source(config.heave.source, base_dir)
 
 
+def resolve_reference_source_mode(reference: str | None) -> bool | str | Path | None:
+    """Translate a train.reference mode into the climatology lookup toggle."""
+    mode = _normalize_reference_mode(reference)
+    if mode == "ecco":
+        return None
+    if mode == "profile":
+        return False
+    raise ValueError(f"Unsupported reference mode: {reference!r}")
+
+
 def _resolve_path_value(value: str | Path | None, base_dir: Path) -> Path | None:
     if value is None:
         return None
@@ -454,6 +528,24 @@ def _resolve_heave_source(value: bool | str | Path | None, base_dir: Path) -> bo
     if isinstance(value, bool) or value is None:
         return value
     return _resolve_path_value(value, base_dir)
+
+
+def _normalize_reference_mode(value: str | None) -> str:
+    if value is None:
+        return "ecco"
+    mode = str(value).strip().lower()
+    if mode not in {"ecco", "profile"}:
+        raise ValueError("train.reference must be either 'ecco' or 'profile'.")
+    return mode
+
+
+def _normalize_profile_type(value: str | None) -> str:
+    if value is None:
+        return "adjusted"
+    mode = str(value).strip().lower()
+    if mode not in {"adjusted", "raw"}:
+        raise ValueError("profile_type must be either 'adjusted' or 'raw'.")
+    return mode
 
 
 def _first_path(*values: str | Path | None) -> Path | None:
@@ -495,6 +587,8 @@ def _apply_runtime_overrides(
         _set_if_not_none(train, "train_root", train_root)
         _set_if_not_none(train, "test_root", runtime.get("test_root"))
         _set_if_not_none(train, "data_source", runtime.get("data_source"))
+        _set_if_not_none(train, "profile_type", runtime.get("profile_type"))
+        _set_if_not_none(train, "raw_fallback", runtime.get("raw_fallback"))
         _set_if_not_none(train, "output", runtime.get("output"))
         _set_if_not_none(train, "seed", runtime.get("seed"))
         _set_if_not_none(train, "profile_limit", runtime.get("profile_limit"))
@@ -522,6 +616,8 @@ def _apply_runtime_overrides(
         _set_if_not_none(predict, "pattern", runtime.get("pattern"))
         _set_if_not_none(predict, "min_levels", runtime.get("min_levels"))
         _set_if_not_none(predict, "good_qc_only", runtime.get("good_qc_only"))
+        _set_if_not_none(predict, "profile_type", runtime.get("profile_type"))
+        _set_if_not_none(predict, "raw_fallback", runtime.get("raw_fallback"))
         _set_if_not_none(predict, "profile_limit", runtime.get("profile_limit"))
         _set_if_not_none(predict, "device", runtime.get("device"))
         _set_if_not_none(predict, "run_root", runtime.get("run_root"))
@@ -624,47 +720,6 @@ def _extract_sigma_from_attrs(profile: ProfileInput) -> np.ndarray | None:
         if value is not None:
             return _coerce_sigma_array(value, profile.n_levels)
     return None
-
-
-def _compute_sigma_heave(profile: ProfileInput, sigma_vert: np.ndarray | float) -> tuple[np.ndarray, np.ndarray]:
-    sigma_arr = _coerce_sigma_array(sigma_vert, profile.n_levels)
-    if sigma_arr is None:
-        return np.zeros(profile.n_levels, dtype=float), np.zeros(profile.n_levels, dtype=float)
-
-    temp_grad = _safe_gradient(profile.temperature, profile.pressure)
-    sal_grad = _safe_gradient(profile.salinity, profile.pressure)
-    sigma_heave_t = np.abs(temp_grad) * sigma_arr
-    sigma_heave_s = np.abs(sal_grad) * sigma_arr
-    return sigma_heave_t.astype(float), sigma_heave_s.astype(float)
-
-
-def _safe_gradient(values: np.ndarray, pressure: np.ndarray) -> np.ndarray:
-    x = np.asarray(values, dtype=float)
-    p = np.asarray(pressure, dtype=float)
-    if x.size != p.size:
-        raise ValueError("pressure and values must have the same length.")
-    finite = np.isfinite(x) & np.isfinite(p)
-    if int(np.sum(finite)) < 2:
-        return np.zeros_like(x, dtype=float)
-    filled = _fill_missing(x, p)
-    try:
-        grad = np.gradient(filled, p, edge_order=1)
-    except Exception:
-        grad = np.zeros_like(filled, dtype=float)
-    return np.nan_to_num(np.asarray(grad, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _fill_missing(values: np.ndarray, pressure: np.ndarray) -> np.ndarray:
-    x = np.asarray(values, dtype=float).copy()
-    p = np.asarray(pressure, dtype=float)
-    finite = np.isfinite(x) & np.isfinite(p)
-    if int(np.sum(finite)) == 0:
-        return np.zeros_like(x, dtype=float)
-    if int(np.sum(finite)) == 1:
-        x[:] = x[finite][0]
-        return x
-    x[~finite] = np.interp(p[~finite], p[finite], x[finite])
-    return x
 
 
 def _coerce_sigma_array(value: Any, n_levels: int) -> np.ndarray | None:

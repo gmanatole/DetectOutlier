@@ -10,9 +10,10 @@ data_root = "data"
 model_checkpoint = "checkpoints/train_dataset_20ep.pt"
 
 [heave]
-# false disables auxiliary heave loading.
+# false disables auxiliary sigma_vert loading.
 # true uses sigma information already present on the profile.
 # a path loads sigma from a NetCDF file with sigma + latitude/longitude/time.
+# Heave uncertainty is derived from the active reference profile when available.
 source = false
 
 [inputs]
@@ -30,6 +31,8 @@ day_of_year = true
 train_root = "data"
 output = "checkpoints/train_dataset_20ep.pt"
 data_source = "argo"
+profile_type = "adjusted"
+raw_fallback = false
 run_root = "artifacts/train_runs"
 seed = 4
 n_examples_per_profile = 1
@@ -42,6 +45,7 @@ batch_size = 8
 learning_rate = 0.001
 val_fraction = 0.1
 test_augment = false
+reference = "ecco"
 device = "cpu"
 epoch_plot_count = 10
 good_qc_only = true
@@ -52,6 +56,8 @@ checkpoint = "checkpoints/train_dataset_20ep.pt"
 pattern = "**/*.nc"
 min_levels = 5
 good_qc_only = false
+profile_type = "adjusted"
+raw_fallback = false
 device = "cpu"
 run_root = "artifacts/predict_runs"
 seed = 4

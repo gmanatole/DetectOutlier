@@ -93,7 +93,7 @@ sphinx-build -b html docs docs/_build/html
 
 ## Configuration
 
-The starter config file is [outlierdetect.toml](outlierdetect.toml). It covers data roots, checkpoint paths, heave-source handling, and the main training and prediction toggles.
+The starter config file is [outlierdetect.toml](outlierdetect.toml). It covers data roots, checkpoint paths, sigma-vert loading for heave lookup, and the main training and prediction toggles.
 
 CLI flags override TOML values, and each run writes the resolved configuration into its output directory.
 

@@ -8,7 +8,12 @@ from outlierdetect import Heuristic, ProfileInput, build_level_features, linear_
 from outlierdetect.argo import ArgoProfile
 from outlierdetect.cli import _build_train_parser
 from outlierdetect.en4 import read_en4_file
-from outlierdetect.runtime_config import load_app_config, resolved_run_config_dict
+from outlierdetect.runtime_config import (
+    load_app_config,
+    resolve_profile_input,
+    resolve_reference_source_mode,
+    resolved_run_config_dict,
+)
 from outlierdetect.training.artifacts import TrainingRunWriter
 from outlierdetect.training.en4 import build_en4_synthetic_examples
 from outlierdetect.training.synthetic import degrade_highres_profile
@@ -114,6 +119,204 @@ def test_profile_features_expose_bayesian_nuisance_posterior():
     assert bias.uncertainty["correlation"][0][2] > 0
 
 
+def test_reference_climatology_is_used_by_default(tmp_path):
+    pytest.importorskip("netCDF4")
+
+    from netCDF4 import Dataset
+
+    ref_path = tmp_path / "reference.nc"
+    z = np.array([0.0, 50.0, 100.0], dtype=np.float32)
+    latitudes = np.array([10.0, 20.0], dtype=np.float32)
+    longitudes = np.array([-30.0, 40.0], dtype=np.float32)
+
+    with Dataset(ref_path, "w", format="NETCDF4") as ds:
+        ds.createDimension("month", 12)
+        ds.createDimension("Z", z.size)
+        ds.createDimension("latitude", latitudes.size)
+        ds.createDimension("longitude", longitudes.size)
+        ds.createDimension("nv", 2)
+
+        ds.createVariable("month", "i4", ("month",))[:] = np.arange(1, 13, dtype=np.int32)
+        ds.createVariable("Z", "f4", ("Z",))[:] = z
+        ds.createVariable("latitude", "f4", ("latitude",))[:] = latitudes
+        ds.createVariable("longitude", "f4", ("longitude",))[:] = longitudes
+        theta = ds.createVariable("THETA", "f4", ("month", "Z", "latitude", "longitude"), fill_value=9.96921e36)
+        salt = ds.createVariable("SALT", "f4", ("month", "Z", "latitude", "longitude"), fill_value=9.96921e36)
+
+        for month in range(12):
+            for ilat in range(latitudes.size):
+                for ilon in range(longitudes.size):
+                    theta[month, :, ilat, ilon] = (month + 1) + 10.0 * ilat + 100.0 * ilon + 0.5 * z
+                    salt[month, :, ilat, ilon] = (month + 1) + 2.0 * ilat + 3.0 * ilon + 0.1 * z
+
+    profile = ProfileInput(
+        pressure=np.array([0.0, 50.0, 100.0], dtype=float),
+        temperature=np.array([112.25, 137.25, 162.25], dtype=float),
+        salinity=np.array([6.5, 11.5, 16.5], dtype=float),
+        sigma_vert=np.full(3, 4.0, dtype=float),
+        attrs={"latitude": 19.8, "longitude": 39.7},
+        day_of_year=45.0,
+    )
+
+    resolved = resolve_profile_input(profile, reference_source=ref_path)
+    assert resolved.reference_residual_t is not None
+    assert resolved.reference_residual_s is not None
+    assert resolved.reference_sigma_heave_t is not None
+    assert resolved.reference_sigma_heave_s is not None
+    assert np.allclose(resolved.reference_residual_t, 0.25)
+    assert np.allclose(resolved.reference_residual_s, -0.5)
+    assert np.allclose(resolved.reference_sigma_heave_t, 2.0)
+    assert np.allclose(resolved.reference_sigma_heave_s, 0.4)
+    assert np.allclose(resolved.residual_t, 0.25)
+    assert np.allclose(resolved.residual_s, -0.5)
+    assert np.allclose(resolved.sigma_heave_t, 2.0)
+    assert np.allclose(resolved.sigma_heave_s, 0.4)
+
+    feats = build_level_features(resolved)
+    assert np.allclose(feats.column("residual_t"), 0.25)
+    assert np.allclose(feats.column("residual_s"), -0.5)
+    assert np.allclose(feats.column("sigma_heave_t"), 2.0)
+    assert np.allclose(feats.column("sigma_heave_s"), 0.4)
+    assert np.allclose(feats.column("has_residual_t"), 1.0)
+    assert np.allclose(feats.column("has_residual_s"), 1.0)
+
+
+def test_degrade_highres_profile_uses_reference_climatology(tmp_path):
+    pytest.importorskip("netCDF4")
+
+    from netCDF4 import Dataset
+
+    ref_path = tmp_path / "reference.nc"
+    z = np.array([0.0, 50.0, 100.0], dtype=np.float32)
+    latitudes = np.array([10.0, 20.0], dtype=np.float32)
+    longitudes = np.array([-30.0, 40.0], dtype=np.float32)
+
+    with Dataset(ref_path, "w", format="NETCDF4") as ds:
+        ds.createDimension("month", 12)
+        ds.createDimension("Z", z.size)
+        ds.createDimension("latitude", latitudes.size)
+        ds.createDimension("longitude", longitudes.size)
+        ds.createDimension("nv", 2)
+
+        ds.createVariable("month", "i4", ("month",))[:] = np.arange(1, 13, dtype=np.int32)
+        ds.createVariable("Z", "f4", ("Z",))[:] = z
+        ds.createVariable("latitude", "f4", ("latitude",))[:] = latitudes
+        ds.createVariable("longitude", "f4", ("longitude",))[:] = longitudes
+        theta = ds.createVariable("THETA", "f4", ("month", "Z", "latitude", "longitude"), fill_value=9.96921e36)
+        salt = ds.createVariable("SALT", "f4", ("month", "Z", "latitude", "longitude"), fill_value=9.96921e36)
+
+        for month in range(12):
+            for ilat in range(latitudes.size):
+                for ilon in range(longitudes.size):
+                    theta[month, :, ilat, ilon] = (month + 1) + 10.0 * ilat + 100.0 * ilon + 0.5 * z
+                    salt[month, :, ilat, ilon] = (month + 1) + 2.0 * ilat + 3.0 * ilon + 0.1 * z
+
+    p_hr = np.linspace(0.0, 100.0, 8, dtype=float)
+    t_hr = 10.0 + 0.2 * p_hr
+    s_hr = 34.0 + 0.01 * p_hr
+
+    synth = degrade_highres_profile(
+        p_hr,
+        t_hr,
+        s_hr,
+        rng=np.random.default_rng(4),
+        pressure_levels=np.array([0.0, 50.0, 100.0], dtype=float),
+        obs_noise_t=0.0,
+        obs_noise_s=0.0,
+        ref_noise_t=0.0,
+        ref_noise_s=0.0,
+        sigma_ocean_t=0.0,
+        sigma_ocean_s=0.0,
+        sigma_vert_range=(4.0, 4.0),
+        spike_probability=0.0,
+        pressure_error_probability=0.0,
+        global_bad_probability=0.0,
+        large_bias_probability=0.0,
+        latitude=19.8,
+        longitude=39.7,
+        day_of_year=45.0,
+        profile_id="synthetic_reference_profile",
+        reference_source=ref_path,
+    )
+
+    resolved = resolve_profile_input(synth.example.profile, reference_source=ref_path)
+    assert synth.example.profile.reference_residual_t is not None
+    assert synth.example.profile.reference_residual_s is not None
+    assert synth.example.profile.reference_sigma_heave_t is not None
+    assert synth.example.profile.reference_sigma_heave_s is not None
+    assert np.allclose(synth.example.profile.residual_t, resolved.reference_residual_t)
+    assert np.allclose(synth.example.profile.residual_s, resolved.reference_residual_s)
+    assert np.allclose(synth.example.profile.sigma_heave_t, resolved.reference_sigma_heave_t)
+    assert np.allclose(synth.example.profile.sigma_heave_s, resolved.reference_sigma_heave_s)
+    feats = build_level_features(synth.example.profile)
+    assert np.allclose(feats.column("has_residual_t"), 1.0)
+    assert np.allclose(feats.column("has_residual_s"), 1.0)
+
+
+def test_profile_reference_mode_keeps_legacy_synthetic_residuals_and_disables_raw_climatology():
+    assert resolve_reference_source_mode("ecco") is None
+    assert resolve_reference_source_mode("profile") is False
+
+    p_hr = np.linspace(0.0, 100.0, 8, dtype=float)
+    t_hr = 10.0 + 0.2 * p_hr
+    s_hr = 34.0 + 0.01 * p_hr
+
+    synth = degrade_highres_profile(
+        p_hr,
+        t_hr,
+        s_hr,
+        rng=np.random.default_rng(5),
+        pressure_levels=np.array([0.0, 50.0, 100.0], dtype=float),
+        obs_noise_t=0.0,
+        obs_noise_s=0.0,
+        ref_noise_t=0.0,
+        ref_noise_s=0.0,
+        sigma_ocean_t=0.0,
+        sigma_ocean_s=0.0,
+        sigma_vert_range=(0.0, 0.0),
+        spike_probability=0.0,
+        pressure_error_probability=0.0,
+        global_bad_probability=0.0,
+        large_bias_probability=0.0,
+        latitude=19.8,
+        longitude=39.7,
+        day_of_year=45.0,
+        profile_id="synthetic_profile_mode",
+        reference_source=False,
+    )
+
+    assert synth.example.profile.reference_residual_t is None
+    assert synth.example.profile.reference_residual_s is None
+    assert synth.example.profile.reference_sigma_heave_t is None
+    assert synth.example.profile.reference_sigma_heave_s is None
+    assert synth.example.profile.residual_t is not None
+    assert synth.example.profile.residual_s is not None
+    assert synth.example.profile.sigma_heave_t is not None
+    assert synth.example.profile.sigma_heave_s is not None
+    feats = build_level_features(synth.example.profile)
+    assert np.allclose(feats.column("has_residual_t"), 1.0)
+    assert np.allclose(feats.column("has_residual_s"), 1.0)
+
+    raw_profile = ProfileInput(
+        pressure=np.array([0.0, 50.0, 100.0], dtype=float),
+        temperature=np.array([12.0, 13.0, 14.0], dtype=float),
+        salinity=np.array([34.0, 34.1, 34.2], dtype=float),
+        sigma_vert=np.full(3, 6.0, dtype=float),
+        attrs={"latitude": 19.8, "longitude": 39.7},
+        day_of_year=45.0,
+    )
+    resolved = resolve_profile_input(raw_profile, reference_source=False)
+    assert resolved.reference_residual_t is None
+    assert resolved.reference_residual_s is None
+    assert resolved.reference_sigma_heave_t is None
+    assert resolved.reference_sigma_heave_s is None
+    assert resolved.sigma_heave_t is None
+    assert resolved.sigma_heave_s is None
+    raw_feats = build_level_features(resolved)
+    assert np.allclose(raw_feats.column("has_residual_t"), 0.0)
+    assert np.allclose(raw_feats.column("has_residual_s"), 0.0)
+
+
 def test_heuristic_predict_returns_object():
     p_hr = np.linspace(0, 500, 120)
     t_hr = 5 - 4 * (1 - np.exp(-p_hr / 120))
@@ -178,6 +381,46 @@ def test_reconstruction_plot_colors_input_points_by_outlier_probability(tmp_path
     assert np.allclose(scatter.get_array(), np.array([0.0, 0.5, 1.0]))
     assert len(fig.axes) == 2
     assert fig.axes[1].get_ylabel() == "point_outlier_probability"
+
+
+def test_reconstruction_plot_triggers_gc(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+
+    writer = TrainingRunWriter(run_root=tmp_path / "runs", examples=[])
+
+    calls = {"gc": 0, "trim": 0}
+
+    def fake_collect():
+        calls["gc"] += 1
+        return 0
+
+    def fake_trim():
+        calls["trim"] += 1
+
+    monkeypatch.setattr("outlierdetect.training.artifacts.gc.collect", fake_collect)
+    monkeypatch.setattr("outlierdetect.training.artifacts._trim_memory", fake_trim)
+
+    writer._save_reconstruction_plot(
+        tmp_path / "plot.png",
+        profile_id="demo",
+        pressure=np.array([0.0, 10.0, 20.0]),
+        temperature=np.array([5.0, 4.0, 3.0]),
+        salinity=np.array([34.0, 34.2, 34.4]),
+        point_outlier_probability=np.array([0.0, 0.5, 1.0]),
+        recon_temperature=np.array([5.1, 4.1, 3.1]),
+        recon_salinity=np.array([34.05, 34.15, 34.25]),
+        truth_temperature=None,
+        truth_salinity=None,
+        epoch=1,
+        rank=1,
+    )
+
+    assert calls["gc"] == 1
+    assert calls["trim"] == 1
 
 
 def test_record_epoch_uses_model_density_probabilities(tmp_path, monkeypatch):
@@ -362,11 +605,8 @@ def test_en4_reader_falls_back_when_primary_variable_is_unreadable(monkeypatch):
     )
 
     monkeypatch.setattr("outlierdetect.en4._open_nc", lambda path: ds)
-    profiles = read_en4_file("demo_199001.nc", good_qc_only=False, min_levels=2)
-
-    assert len(profiles) == 1
-    profile = profiles[0]
-    assert np.allclose(profile.temperature, np.array([10.0, 9.5, 9.0]))
+    with pytest.raises(RuntimeError):
+        read_en4_file("demo_199001.nc", good_qc_only=False, min_levels=2)
 
 
 def test_en4_reader_ignores_blank_profile_qc(monkeypatch):
@@ -390,7 +630,7 @@ def test_en4_reader_ignores_blank_profile_qc(monkeypatch):
     ds = FakeDataset(
         {
             "DEPH_CORRECTED": FakeVar(np.array([[0.0, 10.0, 20.0]], dtype=float)),
-            "TEMP": FakeVar(np.array([[10.0, 9.5, 9.0]], dtype=float)),
+            "TEMP_ADJUSTED": FakeVar(np.array([[10.0, 9.5, 9.0]], dtype=float)),
             "PSAL_CORRECTED": FakeVar(np.array([[35.0, 34.9, 34.8]], dtype=float)),
             "PROFILE_DEPH_QC": FakeVar(np.array([b""], dtype="S1")),
             "PROFILE_POTM_QC": FakeVar(np.array([1], dtype=np.uint8)),
@@ -496,6 +736,58 @@ def test_en4_reader_uses_raw_values_without_qc_masking(monkeypatch):
     assert np.allclose(profile.salinity, np.array([31.0, 32.0, 33.0]))
 
 
+def test_en4_reader_uses_raw_fallback_when_adjusted_salinity_is_missing(monkeypatch):
+    class FakeVar:
+        def __init__(self, data):
+            self.data = np.asarray(data)
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+    class FakeDataset:
+        def __init__(self, variables):
+            self.variables = variables
+
+        def __getitem__(self, key):
+            return self.variables[key]
+
+        def close(self):
+            return None
+
+    ds = FakeDataset(
+        {
+            "DEPH_CORRECTED": FakeVar(np.array([[0.0, 10.0, 20.0]], dtype=float)),
+            "POTM_CORRECTED": FakeVar(np.array([[10.0, 9.5, 9.0]], dtype=float)),
+            "PSAL": FakeVar(np.array([[35.0, 34.9, 34.8]], dtype=float)),
+            "DEPH_CORRECTED_QC": FakeVar(np.array([[1, 1, 1]], dtype=np.uint8)),
+            "POTM_CORRECTED_QC": FakeVar(np.array([[1, 1, 1]], dtype=np.uint8)),
+            "PSAL_QC": FakeVar(np.array([[1, 1, 1]], dtype=np.uint8)),
+            "CYCLE_NUMBER": FakeVar(np.array([7], dtype=float)),
+            "JULD": FakeVar(np.array([100.0], dtype=float)),
+            "LATITUDE": FakeVar(np.array([45.0], dtype=float)),
+            "LONGITUDE": FakeVar(np.array([-20.0], dtype=float)),
+        }
+    )
+
+    monkeypatch.setattr("outlierdetect.en4._open_nc", lambda path: ds)
+
+    with pytest.raises(KeyError):
+        read_en4_file("demo_199001.nc", good_qc_only=False, min_levels=2, profile_type="adjusted")
+
+    profiles = read_en4_file(
+        "demo_199001.nc",
+        good_qc_only=False,
+        min_levels=2,
+        profile_type="adjusted",
+        raw_fallback=True,
+    )
+
+    assert len(profiles) == 1
+    profile = profiles[0]
+    assert np.allclose(profile.temperature, np.array([10.0, 9.5, 9.0]))
+    assert np.allclose(profile.salinity, np.array([35.0, 34.9, 34.8]))
+
+
 def test_argo_reader_uses_raw_values_without_qc_masking(monkeypatch):
     class FakeVar:
         def __init__(self, data):
@@ -535,6 +827,59 @@ def test_argo_reader_uses_raw_values_without_qc_masking(monkeypatch):
     from outlierdetect.argo import read_argo_file
 
     profiles = read_argo_file("demo_199001.nc", good_qc_only=True, min_levels=2, use_raw_values=True)
+
+    assert len(profiles) == 1
+    profile = profiles[0]
+    assert np.allclose(profile.temperature, np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(profile.salinity, np.array([31.0, 32.0, 33.0]))
+
+
+def test_argo_reader_uses_raw_fallback_when_adjusted_salinity_is_missing(monkeypatch):
+    class FakeVar:
+        def __init__(self, data):
+            self.data = np.asarray(data)
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+    class FakeDataset:
+        def __init__(self, variables):
+            self.variables = variables
+
+        def __getitem__(self, key):
+            return self.variables[key]
+
+        def close(self):
+            return None
+
+    ds = FakeDataset(
+        {
+            "PRES_ADJUSTED": FakeVar(np.array([[0.0, 10.0, 20.0]], dtype=float)),
+            "TEMP_ADJUSTED": FakeVar(np.array([[1.0, 2.0, 3.0]], dtype=float)),
+            "PSAL": FakeVar(np.array([[31.0, 32.0, 33.0]], dtype=float)),
+            "PRES_ADJUSTED_QC": FakeVar(np.array([[1, 1, 1]], dtype=np.uint8)),
+            "TEMP_ADJUSTED_QC": FakeVar(np.array([[1, 1, 1]], dtype=np.uint8)),
+            "PSAL_QC": FakeVar(np.array([[1, 1, 1]], dtype=np.uint8)),
+            "CYCLE_NUMBER": FakeVar(np.array([7], dtype=float)),
+            "JULD": FakeVar(np.array([100.0], dtype=float)),
+            "LATITUDE": FakeVar(np.array([45.0], dtype=float)),
+            "LONGITUDE": FakeVar(np.array([-20.0], dtype=float)),
+        }
+    )
+
+    monkeypatch.setattr("outlierdetect.argo._open_nc", lambda path: ds)
+    from outlierdetect.argo import read_argo_file
+
+    with pytest.raises(KeyError):
+        read_argo_file("demo_199001.nc", good_qc_only=False, min_levels=2, profile_type="adjusted")
+
+    profiles = read_argo_file(
+        "demo_199001.nc",
+        good_qc_only=False,
+        min_levels=2,
+        profile_type="adjusted",
+        raw_fallback=True,
+    )
 
     assert len(profiles) == 1
     profile = profiles[0]
@@ -676,6 +1021,70 @@ def test_argo_subsampling_stays_profile_specific():
     assert not np.array_equal(pressures[0], pressures[1])
     assert np.all(np.isin(pressures[0], profile_a.pressure))
     assert np.all(np.isin(pressures[1], profile_b.pressure))
+
+
+def test_argo_profile_limit_samples_after_filtering_and_randomly(monkeypatch):
+    from outlierdetect.argo import ArgoProfile
+    from outlierdetect.training.argo import build_argo_synthetic_examples
+
+    profiles = [
+        ArgoProfile(
+            "too_short",
+            np.array([0.0, 10.0, 20.0], dtype=float),
+            np.array([5.0, 4.6, 4.2], dtype=float),
+            np.array([34.0, 34.1, 34.2], dtype=float),
+        ),
+        ArgoProfile(
+            "keep_a",
+            np.array([0.0, 10.0, 20.0, 30.0, 40.0], dtype=float),
+            np.array([5.0, 4.7, 4.4, 4.1, 3.8], dtype=float),
+            np.array([34.0, 34.1, 34.2, 34.3, 34.4], dtype=float),
+        ),
+        ArgoProfile(
+            "keep_b",
+            np.array([0.0, 12.0, 24.0, 36.0, 48.0], dtype=float),
+            np.array([5.2, 4.9, 4.5, 4.0, 3.6], dtype=float),
+            np.array([34.1, 34.2, 34.3, 34.4, 34.5], dtype=float),
+        ),
+        ArgoProfile(
+            "keep_c",
+            np.array([0.0, 15.0, 30.0, 45.0, 60.0], dtype=float),
+            np.array([5.1, 4.8, 4.3, 3.9, 3.5], dtype=float),
+            np.array([34.05, 34.15, 34.25, 34.35, 34.45], dtype=float),
+        ),
+    ]
+
+    real_default_rng = np.random.default_rng
+
+    class WrappedRNG:
+        def __init__(self, rng, *, force_choice: bool = False):
+            self._rng = rng
+            self._force_choice = force_choice
+
+        def choice(self, a, size=None, replace=True, p=None, axis=0, shuffle=True):
+            if self._force_choice and a == 3 and size == 1 and replace is False and p is None:
+                return np.array([2], dtype=np.int64)
+            return self._rng.choice(a, size=size, replace=replace, p=p, axis=axis, shuffle=shuffle)
+
+        def __getattr__(self, name):
+            return getattr(self._rng, name)
+
+    def fake_default_rng(seed=None):
+        return WrappedRNG(real_default_rng(seed), force_choice=seed == 123)
+
+    monkeypatch.setattr(np.random, "default_rng", fake_default_rng)
+
+    synth = build_argo_synthetic_examples(
+        profiles,
+        n_examples_per_profile=1,
+        n_levels=5,
+        profile_limit=1,
+        min_levels=5,
+        seed=123,
+    )
+
+    assert len(synth) == 1
+    assert synth[0].example.profile.profile_id == "keep_c"
 
 
 def test_argo_parquet_export_walks_recursively(tmp_path, monkeypatch):
@@ -864,6 +1273,8 @@ day_of_year = false
 [train]
 argo_root = "argo/train"
 test_root = "argo/test"
+profile_type = "raw"
+raw_fallback = true
 output = "checkpoints/train.pt"
 run_root = "runs/train"
 epochs = 12
@@ -872,6 +1283,8 @@ val_fraction = 0.2
 
 [predict]
 predict_root = "argo/predict"
+profile_type = "adjusted"
+raw_fallback = false
 checkpoint = "checkpoints/predict.pt"
 run_root = "runs/predict"
 """,
@@ -887,8 +1300,12 @@ run_root = "runs/predict"
     assert config.heave.source == config_dir / "heave/sigma.nc"
     assert config.train.train_root == config_dir / "argo/train"
     assert config.train.test_root == config_dir / "argo/test"
+    assert config.train.profile_type == "raw"
+    assert config.train.raw_fallback is True
     assert config.train.output == config_dir / "checkpoints/train.pt"
     assert config.predict.predict_root == config_dir / "argo/predict"
+    assert config.predict.profile_type == "adjusted"
+    assert config.predict.raw_fallback is False
     assert config.predict.checkpoint == config_dir / "checkpoints/predict.pt"
 
 
@@ -902,6 +1319,8 @@ def test_resolved_run_config_dict_overrides_toml_defaults(tmp_path):
         seed=99,
         profile_limit=3,
         test_root=tmp_path / "argo-test",
+        profile_type="raw",
+        raw_fallback=True,
         n_examples_per_profile=2,
         n_levels=21,
         min_levels=6,
@@ -936,6 +1355,8 @@ def test_resolved_run_config_dict_overrides_toml_defaults(tmp_path):
     assert resolved["paths"]["train_run_root"] == str(tmp_path / "runs")
     assert resolved["train"]["train_root"] == str(tmp_path / "argo")
     assert resolved["train"]["test_root"] == str(tmp_path / "argo-test")
+    assert resolved["train"]["profile_type"] == "raw"
+    assert resolved["train"]["raw_fallback"] is True
     assert resolved["train"]["epochs"] == 14
     assert resolved["train"]["learning_rate"] == 0.01
     assert resolved["train"]["run_root"] == str(tmp_path / "runs")
@@ -1338,15 +1759,14 @@ def test_train_main_uses_test_root_without_augment(tmp_path, monkeypatch):
     def fake_build_argo_synthetic_examples(root, **kwargs):
         calls.append(str(root))
         if str(root) == str(train_root):
-            assert kwargs.get("use_raw_values") is False
-        if str(root) == str(train_root):
             return [train_synth]
         raise AssertionError(f"Unexpected root: {root}")
 
     def fake_iter_argo_files(root, **kwargs):
         raw_calls["root"] = str(root)
         raw_calls["good_qc_only"] = kwargs.get("good_qc_only")
-        raw_calls["use_raw_values"] = kwargs.get("use_raw_values")
+        raw_calls["profile_type"] = kwargs.get("profile_type")
+        raw_calls["raw_fallback"] = kwargs.get("raw_fallback")
         return [raw_test_profile]
 
     captured = {}
@@ -1404,7 +1824,8 @@ def test_train_main_uses_test_root_without_augment(tmp_path, monkeypatch):
     assert calls == [str(train_root)]
     assert raw_calls["root"] == str(test_root)
     assert raw_calls["good_qc_only"] is False
-    assert raw_calls["use_raw_values"] is True
+    assert raw_calls["profile_type"] == "raw"
+    assert raw_calls["raw_fallback"] is False
     assert captured["train_ids"] == ["train_main_train_profile"]
     assert captured["val_loader_none"] is True
     assert captured["eval_ids"] == []
@@ -1446,8 +1867,7 @@ def test_train_main_uses_test_root_with_augment(tmp_path, monkeypatch):
     calls = []
 
     def fake_build_argo_synthetic_examples(root, **kwargs):
-        calls.append((str(root), kwargs.get("use_raw_values")))
-        assert kwargs.get("use_raw_values") is False
+        calls.append((str(root), kwargs.get("profile_type"), kwargs.get("raw_fallback")))
         if str(root) == str(train_root):
             return [train_synth]
         if str(root) == str(test_root):
@@ -1506,7 +1926,10 @@ def test_train_main_uses_test_root_with_augment(tmp_path, monkeypatch):
         ]
     )
 
-    assert calls == [(str(train_root), False), (str(test_root), False)]
+    assert calls == [
+        (str(train_root), "adjusted", False),
+        (str(test_root), "raw", False),
+    ]
     assert captured["train_ids"] == ["train_main_train_profile"]
     assert captured["val_loader_none"] is False
     assert captured["eval_ids"] == ["train_main_test_profile"]

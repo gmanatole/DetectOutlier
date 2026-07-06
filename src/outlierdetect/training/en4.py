@@ -25,9 +25,12 @@ def build_en4_synthetic_examples(
     profile_limit: int | None = None,
     min_levels: int = 5,
     good_qc_only: bool = True,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
     seed: int | None = None,
     upper_ocean_bias: float = 1.7,
     use_raw_values: bool = False,
+    reference_source: bool | str | Path | None = None,
 ) -> list[SyntheticExample]:
     """Convert EN4 profiles into synthetic training examples."""
 
@@ -45,6 +48,8 @@ def build_en4_synthetic_examples(
             root,
             good_qc_only=effective_good_qc_only,
             min_levels=min_levels,
+            profile_type=profile_type,
+            raw_fallback=raw_fallback,
             use_raw_values=use_raw_values,
         )
 
@@ -59,6 +64,7 @@ def build_en4_synthetic_examples(
         min_levels=min_levels,
         seed=seed,
         upper_ocean_bias=upper_ocean_bias,
+        reference_source=reference_source,
     )
 
 

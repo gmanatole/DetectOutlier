@@ -34,11 +34,7 @@ def density_proxy(
     lon: float = 0.0,
     lat: float = 0.0,
 ) -> FloatArray:
-    """Return TEOS-10 sigma0 for a profile.
-
-    The name is kept for API compatibility. The result is no longer a linear
-    approximation.
-    """
+    """Return TEOS-10 sigma0 for a profile."""
     return _sigma0_from_profile(pressure, temperature, salinity, lon=lon, lat=lat)
 
 

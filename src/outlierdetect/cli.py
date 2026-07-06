@@ -26,6 +26,7 @@ from .runtime_config import (
     load_app_config,
     predict_parser_defaults,
     resolve_profile_input,
+    resolve_reference_source_mode,
     resolved_run_config_dict,
     train_parser_defaults,
     write_default_config,
@@ -127,8 +128,9 @@ def _add_sigma_heave_argument(parser: argparse.ArgumentParser, default: object) 
         default=default,
         type=_parse_sigma_heave_source_arg,
         help=(
-            "Enable heave from the profile metadata with no value, disable with false, "
-            "or pass a NetCDF path containing sigma + latitude/longitude/time."
+            "Load sigma_vert from profile metadata with no value, disable with false, "
+            "or pass a NetCDF path containing sigma + latitude/longitude/time. "
+            "Heave uncertainty is then derived from the active reference profile."
         ),
     )
 
@@ -303,6 +305,18 @@ def _build_predict_parser(config: AppConfig | None = None) -> argparse.ArgumentP
         default=defaults["good_qc_only"],
         help="Apply QC masking when reading NetCDF inputs",
     )
+    parser.add_argument(
+        "--profile-type",
+        choices=("adjusted", "raw"),
+        default=defaults["profile_type"],
+        help="Select adjusted values when available, or raw values only.",
+    )
+    parser.add_argument(
+        "--raw-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["raw_fallback"],
+        help="When profile-type is adjusted, allow raw values if adjusted values are missing.",
+    )
     parser.add_argument("--profile-limit", type=int, default=defaults["profile_limit"])
     parser.add_argument("--device", type=str, default=defaults["device"])
     parser.add_argument(
@@ -324,6 +338,8 @@ def _load_prediction_profiles(
     good_qc_only: bool = False,
     min_levels: int = 5,
     profile_limit: int | None = None,
+    profile_type: str = "adjusted",
+    raw_fallback: bool = False,
 ) -> list[ArgoProfile]:
     root_path = Path(root)
     if root_path.suffix.lower() in {".parquet", ".pq"}:
@@ -334,6 +350,8 @@ def _load_prediction_profiles(
             pattern=pattern,
             good_qc_only=good_qc_only,
             min_levels=min_levels,
+            profile_type=profile_type,
+            raw_fallback=raw_fallback,
         )
     profile_list = list(profiles)
     if profile_limit is not None:
@@ -372,6 +390,7 @@ def predict_main(argv: list[str] | None = None) -> None:
     args.checkpoint = _resolve_path_arg(args.checkpoint)
     args.run_root = _resolve_path_arg(args.run_root)
     args.sigma_heave_source = _resolve_sigma_heave_source(args.sigma_heave_source)
+    reference_source = resolve_reference_source_mode(config.train.reference)
 
     profiles = _load_prediction_profiles(
         args.predict_root,
@@ -379,6 +398,8 @@ def predict_main(argv: list[str] | None = None) -> None:
         good_qc_only=args.good_qc_only,
         min_levels=args.min_levels,
         profile_limit=args.profile_limit,
+        profile_type=args.profile_type,
+        raw_fallback=args.raw_fallback,
     )
     if not profiles:
         raise RuntimeError("No Argo profiles were selected for prediction.")
@@ -399,6 +420,7 @@ def predict_main(argv: list[str] | None = None) -> None:
                 use_rho_ts=args.use_rho_ts,
                 use_day_of_year=args.use_day_of_year,
                 sigma_heave_source=args.sigma_heave_source,
+                reference_source=reference_source,
             )
         except ValueError as exc:
             skipped += 1
@@ -470,8 +492,8 @@ def _build_train_parser(config: AppConfig | None = None) -> argparse.ArgumentPar
         default=defaults["test_root"],
         help=(
             "Optional held-out directory or file with Argo or EN4 profiles. "
-            "When set, the held-out side is read from raw TEMP/PSAL values without QC masking unless "
-            "--test-augment is enabled. If omitted, the training root is split into train and validation subsets."
+            "When set, the held-out side follows the configured profile source and can be augmented. "
+            "If omitted, the training root is split into train and validation subsets."
         ),
     )
     parser.add_argument(
@@ -488,6 +510,18 @@ def _build_train_parser(config: AppConfig | None = None) -> argparse.ArgumentPar
         choices=("argo", "en4"),
         default=defaults["data_source"],
         help="Select the clean-profile source used to build synthetic training examples",
+    )
+    parser.add_argument(
+        "--profile-type",
+        choices=("adjusted", "raw"),
+        default=defaults["profile_type"],
+        help="Select adjusted values when available, or raw values only.",
+    )
+    parser.add_argument(
+        "--raw-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["raw_fallback"],
+        help="When profile-type is adjusted, allow raw values if adjusted values are missing.",
     )
     parser.add_argument("--output", type=Path, default=defaults["output"], help="Optional checkpoint output path")
     parser.add_argument("--seed", type=int, default=defaults["seed"])
@@ -542,6 +576,7 @@ def train_main(argv: list[str] | None = None) -> None:
     args.output = _resolve_path_arg(args.output)
     args.run_root = _resolve_path_arg(args.run_root)
     args.sigma_heave_source = _resolve_sigma_heave_source(args.sigma_heave_source)
+    reference_source = resolve_reference_source_mode(config.train.reference)
 
     try:
         from torch.utils.data import DataLoader
@@ -555,13 +590,23 @@ def train_main(argv: list[str] | None = None) -> None:
         "en4": build_en4_synthetic_examples,
     }[args.data_source]
 
+    train_profile_source_kwargs = {
+        "profile_type": args.profile_type,
+        "raw_fallback": args.raw_fallback,
+    }
+    test_profile_source_kwargs = {
+        "profile_type": "raw",
+        "raw_fallback": False,
+    }
+
     def _materialize_examples(
         root: str | Path,
         *,
         role: str,
-        use_raw_values: bool,
         augment: bool = True,
+        profile_source_kwargs: dict[str, object] | None = None,
     ) -> list[ProfileExample]:
+        profile_source_kwargs = {} if profile_source_kwargs is None else dict(profile_source_kwargs)
         if not augment:
             root_path = Path(root)
             if args.data_source == "argo" and root_path.suffix.lower() in {".parquet", ".pq"}:
@@ -572,7 +617,7 @@ def train_main(argv: list[str] | None = None) -> None:
                         root_path,
                         good_qc_only=False,
                         min_levels=args.min_levels,
-                        use_raw_values=use_raw_values,
+                        **profile_source_kwargs,
                     )
                 )
             else:
@@ -581,7 +626,7 @@ def train_main(argv: list[str] | None = None) -> None:
                         root_path,
                         good_qc_only=False,
                         min_levels=args.min_levels,
-                        use_raw_values=use_raw_values,
+                        **profile_source_kwargs,
                     )
                 )
             if args.profile_limit is not None:
@@ -604,6 +649,7 @@ def train_main(argv: list[str] | None = None) -> None:
                         use_rho_ts=args.use_rho_ts,
                         use_day_of_year=args.use_day_of_year,
                         sigma_heave_source=args.sigma_heave_source,
+                        reference_source=reference_source,
                     )
                 )
                 for profile in profiles
@@ -619,7 +665,9 @@ def train_main(argv: list[str] | None = None) -> None:
             good_qc_only=args.good_qc_only,
             seed=args.seed,
             upper_ocean_bias=args.upper_ocean_bias,
-            use_raw_values=use_raw_values,
+            use_raw_values=False,
+            reference_source=reference_source,
+            **profile_source_kwargs,
         )
         if not synthetic:
             raise RuntimeError(
@@ -639,13 +687,18 @@ def train_main(argv: list[str] | None = None) -> None:
                     use_rho_ts=args.use_rho_ts,
                     use_day_of_year=args.use_day_of_year,
                     sigma_heave_source=args.sigma_heave_source,
+                    reference_source=reference_source,
                 ),
                 labels=item.example.labels,
             )
             for item in synthetic
         ]
 
-    train_examples = _materialize_examples(args.train_root, role="training", use_raw_values=False)
+    train_examples = _materialize_examples(
+        args.train_root,
+        role="training",
+        profile_source_kwargs=train_profile_source_kwargs,
+    )
     if args.test_root is None:
         train_examples, eval_examples = _split_examples(train_examples, args.val_fraction, args.seed)
         eval_label = "val"
@@ -654,8 +707,8 @@ def train_main(argv: list[str] | None = None) -> None:
         eval_examples = _materialize_examples(
             args.test_root,
             role="held-out evaluation",
-            use_raw_values=not bool(args.test_augment),
             augment=bool(args.test_augment),
+            profile_source_kwargs=test_profile_source_kwargs,
         )
         eval_label = "test"
         val_loader_enabled = bool(args.test_augment)
