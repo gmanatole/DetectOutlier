@@ -1,5 +1,6 @@
 from argparse import Namespace
 import json
+import pickle
 
 import numpy as np
 import pytest
@@ -332,6 +333,51 @@ def test_train_parser_exposes_training_mode():
     assert args.training_mode == "preload"
     args = parser.parse_args(["--train-root", "data", "--training-mode", "stream"])
     assert args.training_mode == "stream"
+
+
+def test_train_parser_exposes_num_workers():
+    parser = _build_train_parser(load_app_config(None))
+    args = parser.parse_args(["--train-root", "data"])
+    assert args.num_workers == 0
+    args = parser.parse_args(["--train-root", "data", "--num-workers", "3"])
+    assert args.num_workers == 3
+
+
+def test_streaming_factory_is_picklable(tmp_path):
+    from outlierdetect.training.streaming import make_training_example_factory
+
+    factory = make_training_example_factory(
+        tmp_path,
+        data_source="argo",
+        augment=False,
+        profile_type="raw",
+        raw_fallback=False,
+        good_qc_only=False,
+        min_levels=5,
+        profile_limit=None,
+        n_examples_per_profile=1,
+        n_levels=20,
+        grid_size=80,
+        seed=4,
+        upper_ocean_bias=1.7,
+        use_raw_values=False,
+        reference_source=False,
+        use_residual_t=True,
+        use_residual_s=True,
+        use_sigma_t=True,
+        use_sigma_s=True,
+        use_sigma_vert=True,
+        use_sigma_heave_t=True,
+        use_sigma_heave_s=True,
+        use_rho_ts=True,
+        use_day_of_year=True,
+        sigma_heave_source=False,
+        source_files=[],
+    )
+
+    payload = pickle.dumps(factory)
+    restored = pickle.loads(payload)
+    assert callable(restored)
 
 
 def test_streaming_dataset_and_norm_accumulator():

@@ -486,6 +486,12 @@ def _build_train_parser(config: AppConfig | None = None) -> argparse.ArgumentPar
         ),
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=defaults["num_workers"],
+        help="Number of DataLoader worker processes.",
+    )
+    parser.add_argument(
         "--profile-type",
         choices=("adjusted", "raw"),
         default=defaults["profile_type"],
@@ -544,6 +550,8 @@ def train_main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv_list)
     if args.train_root is None:
         parser.error("--train-root is required")
+    if int(args.num_workers) < 0:
+        parser.error("--num-workers must be >= 0")
     args.config = _resolve_path_arg(args.config)
     args.train_root = _resolve_path_arg(args.train_root)
     args.test_root = _resolve_path_arg(args.test_root)
@@ -749,9 +757,24 @@ def train_main(argv: list[str] | None = None) -> None:
 
         train_dataset = StreamingProfileDataset(train_factory, norm=None)
         val_dataset = StreamingProfileDataset(eval_factory, norm=None) if eval_factory is not None else None
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_profiles)
+        loader_kwargs = {
+            "batch_size": args.batch_size,
+            "shuffle": False,
+            "collate_fn": collate_profiles,
+            "num_workers": int(args.num_workers),
+        }
+        if int(args.num_workers) > 0:
+            loader_kwargs["persistent_workers"] = True
+        train_loader = DataLoader(train_dataset, **loader_kwargs)
         val_loader = (
-            DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_profiles)
+            DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=collate_profiles,
+                num_workers=int(args.num_workers),
+                persistent_workers=bool(int(args.num_workers) > 0),
+            )
             if val_dataset is not None
             else None
         )
@@ -846,9 +869,24 @@ def train_main(argv: list[str] | None = None) -> None:
     norm = compute_normalization_stats(train_examples)
     train_dataset = ProfileDataset(train_examples, norm=norm)
     val_dataset = ProfileDataset(eval_examples, norm=norm) if (eval_examples and val_loader_enabled) else None
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_profiles)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": True,
+        "collate_fn": collate_profiles,
+        "num_workers": int(args.num_workers),
+    }
+    if int(args.num_workers) > 0:
+        loader_kwargs["persistent_workers"] = True
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
     val_loader = (
-        DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_profiles)
+        DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_profiles,
+            num_workers=int(args.num_workers),
+            persistent_workers=bool(int(args.num_workers) > 0),
+        )
         if val_dataset is not None
         else None
     )

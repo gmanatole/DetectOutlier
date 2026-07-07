@@ -77,6 +77,7 @@ class TrainConfig:
     test_root: str | Path | None = None
     data_source: str = "argo"
     training_mode: str = "preload"
+    num_workers: int = 0
     profile_type: str = "adjusted"
     raw_fallback: bool = False
     output: str | Path | None = None
@@ -222,6 +223,7 @@ def example_app_config() -> AppConfig:
     config.train.test_root = None
     config.train.data_source = "argo"
     config.train.training_mode = "preload"
+    config.train.num_workers = 0
     config.train.profile_type = "adjusted"
     config.train.raw_fallback = False
     config.train.output = "checkpoints/train_dataset_20ep.pt"
@@ -314,6 +316,7 @@ def train_parser_defaults(config: AppConfig) -> dict[str, Any]:
         "test_root": config.train.test_root,
         "data_source": config.train.data_source,
         "training_mode": config.train.training_mode,
+        "num_workers": config.train.num_workers,
         "profile_type": config.train.profile_type,
         "raw_fallback": config.train.raw_fallback,
         "output": _first_path(config.train.output, config.paths.model_checkpoint),
