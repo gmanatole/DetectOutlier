@@ -211,6 +211,13 @@ class TrainingRunWriter:
         self._write_progress()
         return dict(self._progress)
 
+    def set_normalization(self, norm: NormalizationStats | dict[str, float] | None) -> None:
+        """Update the normalization stats used for future plots and progress."""
+
+        self.norm = NormalizationStats.from_mapping(norm)
+        self._progress["norm_stats"] = None if self.norm is None else self.norm.as_dict()
+        self._write_progress()
+
     def finalize(
         self,
         *,

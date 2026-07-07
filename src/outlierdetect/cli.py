@@ -1,8 +1,8 @@
 """Thin command-line entry points for the package workflows.
 
 The CLI is deliberately narrow. It parses file paths and flags, resolves the
-runtime configuration, and delegates to the density, inference, parquet, and
-training modules where the physical logic lives.
+runtime configuration, and delegates to the density, inference, and training
+modules where the physical logic lives.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ import warnings
 import numpy as np
 
 from .argo import ArgoProfile, iter_argo_files
+from .data import NormalizationAccumulator
 from .en4 import iter_en4_files
-from .parquet import iter_argo_parquet_profiles
 from .runtime_config import (
     AppConfig,
     app_config_to_dict,
@@ -36,21 +36,14 @@ from .training.argo import build_argo_synthetic_examples
 from .training.en4 import build_en4_synthetic_examples
 from .training.artifacts import TrainingRunWriter
 from .training.dataset import ProfileDataset, ProfileExample, collate_profiles, compute_normalization_stats
+from .training.streaming import (
+    StreamingProfileDataset,
+    list_source_files,
+    make_training_example_factory,
+    preview_stream_examples,
+    split_source_files,
+)
 from .training.train import fit_model, load_model_from_checkpoint, save_checkpoint
-
-
-def _add_raw_to_parquet_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, default=None, help="TOML config file")
-    parser.add_argument("--input", required=True, help="Directory or file containing Argo NetCDF profiles")
-    parser.add_argument("--output", required=True, type=Path, help="Output parquet file")
-    parser.add_argument("--pattern", default="**/*.nc", help="Recursive glob pattern under --input")
-    parser.add_argument("--min-levels", type=int, default=5)
-    parser.add_argument(
-        "--good-qc-only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep only Argo levels with good QC flags",
-    )
 
 
 def _add_input_toggle_arguments(parser: argparse.ArgumentParser, defaults: dict[str, object]) -> None:
@@ -158,41 +151,16 @@ def _save_run_config(run_dir: Path, payload: dict[str, object]) -> Path:
     return path
 
 
-def _write_raw_to_parquet(args: argparse.Namespace) -> None:
-    from .parquet import write_argo_parquet
-
-    summary = write_argo_parquet(
-        args.input,
-        args.output,
-        pattern=args.pattern,
-        good_qc_only=args.good_qc_only,
-        min_levels=args.min_levels,
-    )
-    print(json.dumps(summary.as_dict(), indent=2, sort_keys=True))
-
-
 def _build_main_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="OutlierDetect command line interface",
         epilog="Use `outlierdetect config --help` to manage user-editable TOML config files.",
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--raw-to-parquet",
-        action="store_true",
-        help="Export raw Argo NetCDF profiles to parquet",
-    )
-    group.add_argument(
+    parser.add_argument(
         "--predict",
         action="store_true",
-        help="Run a trained model on raw Argo or parquet-backed profiles",
+        help="Run a trained model on raw Argo profiles",
     )
-    return parser
-
-
-def _build_raw_to_parquet_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export Argo NetCDF profiles to parquet")
-    _add_raw_to_parquet_arguments(parser)
     return parser
 
 
@@ -291,7 +259,7 @@ def _build_predict_parser(config: AppConfig | None = None) -> argparse.ArgumentP
         "--predict-root",
         default=defaults["predict_root"],
         type=Path,
-        help="Directory or file containing Argo NetCDF profiles, or a parquet dataset exported by outlier-detect",
+        help="Directory or file containing Argo NetCDF profiles",
     )
     parser.add_argument(
         "--pattern",
@@ -342,17 +310,14 @@ def _load_prediction_profiles(
     raw_fallback: bool = False,
 ) -> list[ArgoProfile]:
     root_path = Path(root)
-    if root_path.suffix.lower() in {".parquet", ".pq"}:
-        profiles = iter_argo_parquet_profiles(root_path, min_levels=min_levels)
-    else:
-        profiles = iter_argo_files(
-            root_path,
-            pattern=pattern,
-            good_qc_only=good_qc_only,
-            min_levels=min_levels,
-            profile_type=profile_type,
-            raw_fallback=raw_fallback,
-        )
+    profiles = iter_argo_files(
+        root_path,
+        pattern=pattern,
+        good_qc_only=good_qc_only,
+        min_levels=min_levels,
+        profile_type=profile_type,
+        raw_fallback=raw_fallback,
+    )
     profile_list = list(profiles)
     if profile_limit is not None:
         profile_list = profile_list[: max(int(profile_limit), 0)]
@@ -375,7 +340,7 @@ def _predict_model_factory(metadata: dict[str, object]):
 
 
 def predict_main(argv: list[str] | None = None) -> None:
-    """Run a trained profile QC model on raw Argo or parquet-backed profiles."""
+    """Run a trained profile QC model on raw Argo profiles."""
     argv_list = sys.argv[1:] if argv is None else list(argv)
     if any(arg in {"-h", "--help"} for arg in argv_list):
         _build_predict_parser().print_help()
@@ -477,7 +442,7 @@ def _build_train_parser(config: AppConfig | None = None) -> argparse.ArgumentPar
         "--train-root",
         default=defaults["train_root"],
         type=Path,
-        help="Directory or file with Argo or EN4 profiles, or a parquet dataset exported by outlier-detect",
+        help="Directory or file with Argo or EN4 profiles",
     )
     parser.add_argument(
         "--argo-root",
@@ -510,6 +475,15 @@ def _build_train_parser(config: AppConfig | None = None) -> argparse.ArgumentPar
         choices=("argo", "en4"),
         default=defaults["data_source"],
         help="Select the clean-profile source used to build synthetic training examples",
+    )
+    parser.add_argument(
+        "--training-mode",
+        choices=("preload", "stream"),
+        default=defaults["training_mode"],
+        help=(
+            "Choose whether to materialize all examples before training or to open source files lazily "
+            "inside the dataset/dataloader."
+        ),
     )
     parser.add_argument(
         "--profile-type",
@@ -609,9 +583,7 @@ def train_main(argv: list[str] | None = None) -> None:
         profile_source_kwargs = {} if profile_source_kwargs is None else dict(profile_source_kwargs)
         if not augment:
             root_path = Path(root)
-            if args.data_source == "argo" and root_path.suffix.lower() in {".parquet", ".pq"}:
-                profiles = list(iter_argo_parquet_profiles(root_path, min_levels=args.min_levels))
-            elif args.data_source == "argo":
+            if args.data_source == "argo":
                 profiles = list(
                     iter_argo_files(
                         root_path,
@@ -694,6 +666,163 @@ def train_main(argv: list[str] | None = None) -> None:
             for item in synthetic
         ]
 
+    def _make_stream_factory(
+        root: str | Path,
+        *,
+        augment: bool,
+        source_files: list[Path] | None = None,
+    ):
+        if augment:
+            profile_type = args.profile_type
+            raw_fallback = args.raw_fallback
+            good_qc_only = args.good_qc_only
+        else:
+            profile_type = "raw"
+            raw_fallback = False
+            good_qc_only = False
+        return make_training_example_factory(
+            root,
+            data_source=args.data_source,
+            augment=augment,
+            source_files=source_files,
+            profile_type=profile_type,
+            raw_fallback=raw_fallback,
+            good_qc_only=good_qc_only,
+            min_levels=args.min_levels,
+            profile_limit=args.profile_limit,
+            n_examples_per_profile=args.n_examples_per_profile,
+            n_levels=args.n_levels,
+            grid_size=args.grid_size,
+            seed=args.seed,
+            upper_ocean_bias=args.upper_ocean_bias,
+            use_raw_values=False,
+            reference_source=reference_source,
+            use_residual_t=args.use_residual_t,
+            use_residual_s=args.use_residual_s,
+            use_sigma_t=args.use_sigma_t,
+            use_sigma_s=args.use_sigma_s,
+            use_sigma_vert=args.use_sigma_vert,
+            use_sigma_heave_t=args.use_sigma_heave_t,
+            use_sigma_heave_s=args.use_sigma_heave_s,
+            use_rho_ts=args.use_rho_ts,
+            use_day_of_year=args.use_day_of_year,
+            sigma_heave_source=args.sigma_heave_source,
+            source_name=args.data_source,
+        )
+
+    training_mode = str(args.training_mode).strip().lower()
+    preview_limit = max(int(args.epoch_plot_count), 1)
+    norm: object | None = None
+    total_examples: int | None = None
+
+    if training_mode == "stream":
+        train_source_files = list_source_files(args.train_root)
+        if not train_source_files:
+            raise RuntimeError(f"No {args.data_source.upper()} files were found under {args.train_root}.")
+        train_source_files, _ = split_source_files(train_source_files, 0.0, args.seed)
+
+        if args.test_root is None:
+            train_source_files, eval_source_files = split_source_files(train_source_files, args.val_fraction, args.seed)
+            eval_root = args.train_root
+            eval_augment = True
+            eval_label = "val"
+        else:
+            eval_root = args.test_root
+            eval_source_files = list_source_files(args.test_root)
+            eval_augment = bool(args.test_augment)
+            eval_label = "test"
+
+        train_factory = _make_stream_factory(args.train_root, augment=True, source_files=train_source_files)
+        train_preview = preview_stream_examples(train_factory, limit=preview_limit)
+        if not train_preview:
+            raise RuntimeError(f"No {args.data_source.upper()} profiles were converted into training examples.")
+
+        eval_factory = None
+        eval_preview: list[ProfileExample] = []
+        if eval_source_files:
+            eval_factory = _make_stream_factory(eval_root, augment=eval_augment, source_files=eval_source_files)
+            eval_preview = preview_stream_examples(eval_factory, limit=preview_limit)
+            if not eval_preview and args.test_root is not None:
+                raise RuntimeError(
+                    f"No {args.data_source.upper()} profiles were converted into held-out evaluation examples."
+                )
+
+        train_dataset = StreamingProfileDataset(train_factory, norm=None)
+        val_dataset = StreamingProfileDataset(eval_factory, norm=None) if eval_factory is not None else None
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_profiles)
+        val_loader = (
+            DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_profiles)
+            if val_dataset is not None
+            else None
+        )
+        monitor_examples = eval_preview if eval_preview else train_preview
+        writer = TrainingRunWriter(
+            args.run_root,
+            monitor_examples,
+            norm=None,
+            plot_count=max(int(args.epoch_plot_count), 0),
+            seed=args.seed,
+        )
+        print(f"Training mode: {training_mode} (lazy file loading)")
+        print(f"Writing training artifacts to {writer.run_dir}")
+        _save_run_config(writer.run_dir, resolved_run_config_dict(config=config, command="train", args=args))
+
+        sample = ProfileDataset([train_preview[0]], norm=None)[0]
+        model = Net(NetConfig(input_dim=sample["features"].shape[1], grid_size=args.grid_size))
+        normalization_accumulator = NormalizationAccumulator()
+        history = fit_model(
+            model,
+            train_loader,
+            val_loader,
+            eval_label=eval_label,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            device=args.device,
+            progress=True,
+            normalization_accumulator=normalization_accumulator,
+            normalization_callback=writer.set_normalization,
+            epoch_callback=lambda epoch, model, history: writer.record_epoch(
+                epoch=epoch,
+                model=model,
+                history=history,
+                device=args.device,
+                n_train_examples=None,
+                n_val_examples=None,
+                eval_label=eval_label,
+            ),
+        )
+
+        if args.output is not None:
+            save_checkpoint(
+                args.output,
+                model,
+                metadata={
+                    "input_dim": int(sample["features"].shape[1]),
+                    "grid_size": int(args.grid_size),
+                    "min_levels": int(args.min_levels),
+                    "n_examples": total_examples,
+                    "seed": int(args.seed),
+                    "upper_ocean_bias": float(args.upper_ocean_bias),
+                    "feature_names": list(sample["feature_names"]),
+                    "normalization": None if normalization_accumulator is None else normalization_accumulator.to_stats().as_dict(),
+                    "config": resolved_run_config_dict(config=config, command="train", args=args),
+                },
+            )
+        writer.finalize(history=history, checkpoint_path=args.output)
+
+        summary = {
+            "run_dir": str(writer.run_dir),
+            "progress_file": str(writer.progress_path),
+            "training_mode": training_mode,
+            "n_examples": total_examples,
+            "n_train": None,
+            "n_eval_examples": None,
+            "eval_label": eval_label,
+            "history": history,
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
+
     train_examples = _materialize_examples(
         args.train_root,
         role="training",
@@ -731,6 +860,7 @@ def train_main(argv: list[str] | None = None) -> None:
         plot_count=max(int(args.epoch_plot_count), 0),
         seed=args.seed,
     )
+    print(f"Training mode: {training_mode} (preload into RAM)")
     print(f"Writing training artifacts to {writer.run_dir}")
     _save_run_config(writer.run_dir, resolved_run_config_dict(config=config, command="train", args=args))
 
@@ -744,6 +874,7 @@ def train_main(argv: list[str] | None = None) -> None:
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         device=args.device,
+        progress=True,
         epoch_callback=lambda epoch, model, history: writer.record_epoch(
             epoch=epoch,
             model=model,
@@ -776,6 +907,7 @@ def train_main(argv: list[str] | None = None) -> None:
     summary = {
         "run_dir": str(writer.run_dir),
         "progress_file": str(writer.progress_path),
+        "training_mode": training_mode,
         "n_examples": total_examples,
         "n_train": len(train_examples),
         "n_eval_examples": len(eval_examples),
@@ -784,16 +916,6 @@ def train_main(argv: list[str] | None = None) -> None:
     }
     summary[f"n_{eval_label}"] = len(eval_examples)
     print(json.dumps(summary, indent=2, sort_keys=True))
-
-
-def raw_to_parquet_main(argv: list[str] | None = None) -> None:
-    """Export all Argo NetCDF profiles under a directory to parquet."""
-    parser = _build_raw_to_parquet_parser()
-    args = parser.parse_args(argv)
-    try:
-        _write_raw_to_parquet(args)
-    except (IsADirectoryError, ValueError) as exc:
-        parser.error(str(exc))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -805,9 +927,7 @@ def main(argv: list[str] | None = None) -> None:
     main_parser = _build_main_parser()
 
     if any(arg in {"-h", "--help"} for arg in argv_list):
-        if "--raw-to-parquet" in argv_list:
-            _build_raw_to_parquet_parser().print_help()
-        elif "--predict" in argv_list:
+        if "--predict" in argv_list:
             _build_predict_parser().print_help()
         else:
             main_parser.print_help()
@@ -815,20 +935,11 @@ def main(argv: list[str] | None = None) -> None:
 
     args, remaining = main_parser.parse_known_args(argv_list)
 
-    if args.raw_to_parquet:
-        raw_to_parquet_main(remaining)
-        return
-
     if args.predict:
         predict_main(remaining)
         return
 
-    main_parser.error("Specify either --raw-to-parquet, --predict, or the config subcommand.")
-
-
-def argo_parquet_main(argv: list[str] | None = None) -> None:
-    """Backward-compatible alias for the parquet export CLI."""
-    raw_to_parquet_main(argv)
+    main_parser.error("Specify --predict or the config subcommand.")
 
 
 if __name__ == "__main__":

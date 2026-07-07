@@ -14,7 +14,6 @@ data
 density
 features
 model
-parquet
 runtime_config
 tool
 cli

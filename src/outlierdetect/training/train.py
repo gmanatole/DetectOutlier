@@ -19,7 +19,13 @@ except Exception:  # pragma: no cover - torch is optional
     F = None  # type: ignore[assignment]
     nn = Any  # type: ignore[assignment]
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional
+    tqdm = None  # type: ignore[assignment]
+
 from ..corrections import CorrectionPrior
+from ..data import NormalizationAccumulator, NormalizationStats
 
 
 @dataclass(slots=True)
@@ -34,6 +40,26 @@ class LossWeights:
 
 
 if torch is not None:
+
+    def _with_progress(loader: Any, *, enabled: bool, desc: str | None = None):
+        if not enabled or tqdm is None:
+            return loader
+        total = None
+        try:
+            total = len(loader)
+        except Exception:
+            total = None
+        return tqdm(loader, total=total, desc=desc, leave=False, dynamic_ncols=True)
+
+
+    def _apply_normalization(target: Any, norm: NormalizationStats | dict[str, float]) -> None:
+        if target is None:
+            return
+        if hasattr(target, "set_normalization"):
+            target.set_normalization(norm)
+            return
+        if hasattr(target, "norm"):
+            setattr(target, "norm", norm)
 
     def compute_loss(
         outputs: dict[str, torch.Tensor],
@@ -136,13 +162,22 @@ if torch is not None:
         device: str | torch.device = "cpu",
         weights: LossWeights | None = None,
         grad_clip: float | None = 1.0,
+        progress: bool = True,
+        desc: str | None = None,
+        normalization_accumulator: NormalizationAccumulator | None = None,
     ) -> dict[str, float]:
         """Train one epoch and return averaged losses."""
         model.train()
         model.to(device)
         totals: dict[str, float] = {}
         n_batches = 0
-        for batch in loader:
+        iterator = _with_progress(loader, enabled=progress, desc=desc)
+        for batch in iterator:
+            recon_truth = batch.get("recon_truth_physical")
+            if recon_truth is None:
+                recon_truth = batch.get("recon_truth")
+            if normalization_accumulator is not None:
+                normalization_accumulator.update_from_reconstruction(recon_truth)
             features = batch["features"].to(device)
             mask = batch["mask"].to(device)
             pressure_grid = batch.get("pressure_grid")
@@ -167,6 +202,8 @@ if torch is not None:
         *,
         device: str | torch.device = "cpu",
         weights: LossWeights | None = None,
+        progress: bool = True,
+        desc: str | None = None,
     ) -> dict[str, float]:
         """Evaluate one epoch and return averaged losses."""
         model.eval()
@@ -174,7 +211,8 @@ if torch is not None:
         totals: dict[str, float] = {}
         n_batches = 0
         with torch.no_grad():
-            for batch in loader:
+            iterator = _with_progress(loader, enabled=progress, desc=desc)
+            for batch in iterator:
                 features = batch["features"].to(device)
                 mask = batch["mask"].to(device)
                 pressure_grid = batch.get("pressure_grid")
@@ -201,12 +239,17 @@ if torch is not None:
         optimizer: torch.optim.Optimizer | None = None,
         learning_rate: float = 1e-3,
         epoch_callback: Callable[[int, nn.Module, list[dict[str, float]]], None] | None = None,
+        progress: bool = True,
+        normalization_accumulator: NormalizationAccumulator | None = None,
+        normalization_callback: Callable[[NormalizationStats], None] | None = None,
     ) -> list[dict[str, float]]:
         """Fit a model for a small number of epochs and return per-epoch logs."""
         if optimizer is None:
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
         history: list[dict[str, float]] = []
+        train_dataset = getattr(train_loader, "dataset", None)
+        val_dataset = getattr(val_loader, "dataset", None) if val_loader is not None else None
         for epoch in range(1, max(int(epochs), 1) + 1):
             train_logs = train_epoch(
                 model,
@@ -215,7 +258,14 @@ if torch is not None:
                 device=device,
                 weights=weights,
                 grad_clip=grad_clip,
+                progress=progress,
+                desc=f"train epoch {epoch}/{int(epochs)}",
+                normalization_accumulator=normalization_accumulator if epoch == 1 else None,
             )
+            if normalization_accumulator is not None and epoch == 1:
+                norm = normalization_accumulator.to_stats()
+                _apply_normalization(train_dataset, norm)
+                _apply_normalization(val_dataset, norm)
             train_logs = {f"train_{key}": value for key, value in train_logs.items()}
             train_logs["epoch"] = float(epoch)
             history.append(train_logs)
@@ -226,6 +276,8 @@ if torch is not None:
                     val_loader,
                     device=device,
                     weights=weights,
+                    progress=progress,
+                    desc=f"{eval_label} epoch {epoch}/{int(epochs)}",
                 )
                 label = str(eval_label).strip() or "val"
                 val_logs = {f"{label}_{key}": value for key, value in val_logs.items()}
@@ -234,6 +286,8 @@ if torch is not None:
 
             if epoch_callback is not None:
                 epoch_callback(epoch, model, history)
+            if normalization_accumulator is not None and epoch == 1 and normalization_callback is not None:
+                normalization_callback(norm)
 
         return history
 

@@ -59,7 +59,7 @@ class ArgoProfile:
     ) -> "ProfileInput":
         """Convert this Argo profile into a :class: outlierdetect.data.ProfileInput.
 
-        The inference path uses this to turn raw Argo or parquet-backed profiles
+        The inference path uses this to turn raw Argo profiles
         into the sparse profile object consumed by the model.
         """
         from .data import ProfileInput

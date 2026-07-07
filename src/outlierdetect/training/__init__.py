@@ -21,6 +21,14 @@ from .dataset import (
     collate,
     collate_profiles,
     compute_normalization_stats,
+    profile_example_to_sample,
+)
+from .streaming import (
+    StreamingProfileDataset,
+    list_source_files,
+    make_training_example_factory,
+    preview_stream_examples,
+    split_source_files,
 )
 from .synthetic import SyntheticExample, degrade_highres_profile
 from .train import (
@@ -44,9 +52,15 @@ __all__ = [
     "ProfileDataset",
     "ProfileExample",
     "ProfileLabels",
+    "profile_example_to_sample",
     "compute_normalization_stats",
     "collate",
     "collate_profiles",
+    "StreamingProfileDataset",
+    "list_source_files",
+    "make_training_example_factory",
+    "preview_stream_examples",
+    "split_source_files",
     "degrade_highres_profile",
     "build_argo_dataset",
     "build_argo_examples",

@@ -6,17 +6,17 @@ monthly NetCDF reader as its clean-profile source.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
 from outlierdetect.argo import ArgoProfile
 from outlierdetect.en4 import iter_en4_files
-from outlierdetect.training.builders import build_synthetic_examples_from_profiles
+from outlierdetect.training.builders import iter_synthetic_examples_from_profiles
 from outlierdetect.training.dataset import ProfileDataset, ProfileExample
 from outlierdetect.training.synthetic import SyntheticExample
 
 
-def build_en4_synthetic_examples(
+def iter_en4_synthetic_examples(
     root: str | Path | Sequence[ArgoProfile],
     *,
     n_examples_per_profile: int = 1,
@@ -31,7 +31,7 @@ def build_en4_synthetic_examples(
     upper_ocean_bias: float = 1.7,
     use_raw_values: bool = False,
     reference_source: bool | str | Path | None = None,
-) -> list[SyntheticExample]:
+) -> Iterator[SyntheticExample]:
     """Convert EN4 profiles into synthetic training examples."""
 
     profiles: Sequence[ArgoProfile] | Iterable[ArgoProfile]
@@ -53,7 +53,7 @@ def build_en4_synthetic_examples(
             use_raw_values=use_raw_values,
         )
 
-    return build_synthetic_examples_from_profiles(
+    return iter_synthetic_examples_from_profiles(
         profiles,
         source_name="en4",
         source_profile_id_attr="en4_profile_id",
@@ -66,6 +66,15 @@ def build_en4_synthetic_examples(
         upper_ocean_bias=upper_ocean_bias,
         reference_source=reference_source,
     )
+
+
+def build_en4_synthetic_examples(
+    root: str | Path | Sequence[ArgoProfile],
+    **kwargs: object,
+) -> list[SyntheticExample]:
+    """Convert EN4 profiles into synthetic training examples."""
+
+    return list(iter_en4_synthetic_examples(root, **kwargs))
 
 
 def build_en4_examples(

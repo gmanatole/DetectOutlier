@@ -9,12 +9,11 @@ no global resampling step forces all profiles onto the same observed depth grid.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
 from outlierdetect.argo import ArgoProfile, iter_argo_files
-from outlierdetect.parquet import iter_argo_parquet_profiles
-from outlierdetect.training.builders import build_synthetic_examples_from_profiles
+from outlierdetect.training.builders import iter_synthetic_examples_from_profiles
 from outlierdetect.training.dataset import ProfileDataset, ProfileExample
 from outlierdetect.training.synthetic import SyntheticExample
 
@@ -34,7 +33,7 @@ class ArgoTrainingConfig:
     upper_ocean_bias: float = 1.7
 
 
-def build_argo_synthetic_examples(
+def iter_argo_synthetic_examples(
     root: str | Path | Sequence[ArgoProfile],
     *,
     n_examples_per_profile: int = 1,
@@ -49,7 +48,7 @@ def build_argo_synthetic_examples(
     upper_ocean_bias: float = 1.7,
     use_raw_values: bool = False,
     reference_source: bool | str | Path | None = None,
-) -> list[SyntheticExample]:
+) -> Iterator[SyntheticExample]:
     """Convert Argo profiles into synthetic training examples.
 
     Parameters
@@ -101,18 +100,15 @@ def build_argo_synthetic_examples(
     else:
         effective_good_qc_only = good_qc_only and not use_raw_values
         root_path = Path(root)
-        if root_path.suffix.lower() in {".parquet", ".pq"}:
-            profiles = iter_argo_parquet_profiles(root_path, min_levels=min_levels)
-        else:
-            profiles = iter_argo_files(
-                root,
-                good_qc_only=effective_good_qc_only,
-                min_levels=min_levels,
-                profile_type=profile_type,
-                raw_fallback=raw_fallback,
-                use_raw_values=use_raw_values,
-            )
-    return build_synthetic_examples_from_profiles(
+        profiles = iter_argo_files(
+            root,
+            good_qc_only=effective_good_qc_only,
+            min_levels=min_levels,
+            profile_type=profile_type,
+            raw_fallback=raw_fallback,
+            use_raw_values=use_raw_values,
+        )
+    return iter_synthetic_examples_from_profiles(
         profiles,
         source_name="argo",
         source_profile_id_attr="argo_profile_id",
@@ -125,6 +121,15 @@ def build_argo_synthetic_examples(
         upper_ocean_bias=upper_ocean_bias,
         reference_source=reference_source,
     )
+
+
+def build_argo_synthetic_examples(
+    root: str | Path | Sequence[ArgoProfile],
+    **kwargs: object,
+) -> list[SyntheticExample]:
+    """Convert Argo profiles into synthetic training examples."""
+
+    return list(iter_argo_synthetic_examples(root, **kwargs))
 
 
 def build_argo_examples(

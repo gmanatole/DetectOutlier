@@ -4,7 +4,16 @@ import json
 import numpy as np
 import pytest
 
-from outlierdetect import Heuristic, ProfileInput, build_level_features, linear_detrend
+from outlierdetect import (
+    Heuristic,
+    NormalizationAccumulator,
+    ProfileExample,
+    ProfileInput,
+    ProfileLabels,
+    StreamingProfileDataset,
+    build_level_features,
+    linear_detrend,
+)
 from outlierdetect.argo import ArgoProfile
 from outlierdetect.cli import _build_train_parser
 from outlierdetect.en4 import read_en4_file
@@ -315,6 +324,60 @@ def test_profile_reference_mode_keeps_legacy_synthetic_residuals_and_disables_ra
     raw_feats = build_level_features(resolved)
     assert np.allclose(raw_feats.column("has_residual_t"), 0.0)
     assert np.allclose(raw_feats.column("has_residual_s"), 0.0)
+
+
+def test_train_parser_exposes_training_mode():
+    parser = _build_train_parser(load_app_config(None))
+    args = parser.parse_args(["--train-root", "data"])
+    assert args.training_mode == "preload"
+    args = parser.parse_args(["--train-root", "data", "--training-mode", "stream"])
+    assert args.training_mode == "stream"
+
+
+def test_streaming_dataset_and_norm_accumulator():
+    p = np.array([0.0, 10.0, 20.0], dtype=float)
+    examples = [
+        ProfileExample(
+            profile=ProfileInput(
+                pressure=p,
+                temperature=np.array([1.0, 2.0, 3.0], dtype=float),
+                salinity=np.array([4.0, 5.0, 6.0], dtype=float),
+                attrs={"latitude": 10.0, "longitude": 20.0},
+            ),
+            labels=ProfileLabels(
+                truth_t=np.array([1.0, 3.0, 5.0], dtype=float),
+                truth_s=np.array([2.0, 4.0, 6.0], dtype=float),
+            ),
+        ),
+        ProfileExample(
+            profile=ProfileInput(
+                pressure=p,
+                temperature=np.array([2.0, 4.0, 6.0], dtype=float),
+                salinity=np.array([1.0, 3.0, 5.0], dtype=float),
+                attrs={"latitude": 10.0, "longitude": 20.0},
+            ),
+            labels=ProfileLabels(
+                truth_t=np.array([2.0, 4.0, 6.0], dtype=float),
+                truth_s=np.array([3.0, 5.0, 7.0], dtype=float),
+            ),
+        ),
+    ]
+
+    dataset = StreamingProfileDataset(lambda: iter(examples), norm=None)
+    samples = list(dataset)
+    assert len(samples) == 2
+    assert samples[0]["recon_truth_physical"] is not None
+    assert samples[0]["norm_stats"] is None
+
+    accumulator = NormalizationAccumulator()
+    for sample in samples:
+        accumulator.update_from_reconstruction(sample["recon_truth_physical"])
+    stats = accumulator.to_stats()
+
+    assert np.isclose(stats.temperature_mean, 3.5)
+    assert np.isclose(stats.salinity_mean, 4.5)
+    assert np.isclose(stats.temperature_std, np.std(np.array([1.0, 3.0, 5.0, 2.0, 4.0, 6.0])))
+    assert np.isclose(stats.salinity_std, np.std(np.array([2.0, 4.0, 6.0, 3.0, 5.0, 7.0])))
 
 
 def test_heuristic_predict_returns_object():
@@ -1087,163 +1150,6 @@ def test_argo_profile_limit_samples_after_filtering_and_randomly(monkeypatch):
     assert synth[0].example.profile.profile_id == "keep_c"
 
 
-def test_argo_parquet_export_walks_recursively(tmp_path, monkeypatch):
-    from pathlib import Path
-
-    import pandas as pd
-
-    from outlierdetect.argo import ArgoProfile
-    from outlierdetect.parquet import argo_directory_to_dataframe, collect_nc_paths, write_argo_parquet
-
-    root = tmp_path / "argo"
-    nested = root / "sub" / "dir"
-    nested.mkdir(parents=True)
-    (root / "a.nc").write_text("", encoding="utf-8")
-    (nested / "b.nc").write_text("", encoding="utf-8")
-    (nested / "ignore.txt").write_text("", encoding="utf-8")
-
-    paths = collect_nc_paths(root)
-    assert [path.name for path in paths] == ["a.nc", "b.nc"]
-
-    profiles_by_file = {
-        str(root / "a.nc"): [
-            ArgoProfile("a_001", np.array([0, 10], dtype=float), np.array([5.0, 4.5]), np.array([34.0, 34.1]))
-        ],
-        str(nested / "b.nc"): [
-            ArgoProfile("b_001", np.array([0, 20, 40], dtype=float), np.array([6.0, 5.0, 4.0]), np.array([33.9, 34.0, 34.2])),
-            ArgoProfile("b_002", np.array([5, 15], dtype=float), np.array([7.0, 6.5]), np.array([33.8, 33.9])),
-        ],
-    }
-
-    def fake_read_argo_file(path, good_qc_only=True, min_levels=5):
-        return profiles_by_file[str(Path(path))]
-
-    monkeypatch.setattr("outlierdetect.parquet.read_argo_file", fake_read_argo_file)
-
-    df = argo_directory_to_dataframe(root)
-    assert len(df) == 7
-    assert df.attrs["n_files"] == 2
-    assert df.attrs["n_profiles"] == 3
-    assert set(df["source_file"].unique()) == {str(root / "a.nc"), str(nested / "b.nc")}
-
-    captured = {}
-
-    def fake_to_parquet(self, path, index=False, engine="pyarrow"):
-        captured["path"] = str(path)
-        captured["index"] = index
-        captured["engine"] = engine
-        return None
-
-    monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet, raising=True)
-    output = tmp_path / "out" / "argo.parquet"
-    summary = write_argo_parquet(root, output)
-    assert summary.n_files == 2
-    assert summary.n_profiles == 3
-    assert summary.n_rows == 7
-    assert captured["path"] == str(output)
-    assert captured["index"] is False
-    assert captured["engine"] == "pyarrow"
-
-
-def test_argo_parquet_export_rejects_directory_output(tmp_path):
-    from outlierdetect.parquet import write_argo_parquet
-
-    output_dir = tmp_path / "out"
-    output_dir.mkdir()
-
-    try:
-        write_argo_parquet(tmp_path, output_dir)
-    except IsADirectoryError as exc:
-        assert "parquet file" in str(exc)
-    else:
-        raise AssertionError("Expected write_argo_parquet to reject directory outputs")
-
-
-def test_argo_parquet_profiles_can_be_rehydrated(tmp_path, monkeypatch):
-    import pandas as pd
-
-    from outlierdetect.parquet import iter_argo_parquet_profiles
-
-    df = pd.DataFrame(
-        [
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "latitude": 42.5,
-                "longitude": -68.0,
-                "n_levels": 2,
-                "level_index": 0,
-                "pressure": 0.0,
-                "temperature": 5.0,
-                "salinity": 34.0,
-            },
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "latitude": 42.5,
-                "longitude": -68.0,
-                "n_levels": 2,
-                "level_index": 1,
-                "pressure": 10.0,
-                "temperature": 4.5,
-                "salinity": 34.1,
-            },
-            {
-                "source_file": "b.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "b_001",
-                "float_wmo": "5900002",
-                "cycle_number": 2,
-                "juld": 12346.0,
-                "latitude": 41.0,
-                "longitude": -67.5,
-                "n_levels": 2,
-                "level_index": 0,
-                "pressure": 5.0,
-                "temperature": 6.0,
-                "salinity": 33.9,
-            },
-            {
-                "source_file": "b.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "b_001",
-                "float_wmo": "5900002",
-                "cycle_number": 2,
-                "juld": 12346.0,
-                "latitude": 41.0,
-                "longitude": -67.5,
-                "n_levels": 2,
-                "level_index": 1,
-                "pressure": 15.0,
-                "temperature": 5.5,
-                "salinity": 34.0,
-            },
-        ]
-    )
-
-    monkeypatch.setattr(pd, "read_parquet", lambda path: df)
-
-    profiles = iter_argo_parquet_profiles(tmp_path / "dataset.parquet", min_levels=2)
-    assert len(profiles) == 2
-    assert profiles[0].profile_id == "a_001"
-    assert np.allclose(profiles[0].pressure, [0.0, 10.0])
-    assert profiles[0].float_wmo == "5900001"
-    assert profiles[0].latitude == 42.5
-    assert profiles[0].longitude == -68.0
-    assert profiles[1].profile_id == "b_001"
-    assert np.allclose(profiles[1].temperature, [6.0, 5.5])
-    assert profiles[1].latitude == 41.0
-    assert profiles[1].longitude == -67.5
-
-
 def test_load_app_config_resolves_relative_paths(tmp_path):
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
@@ -1425,173 +1331,6 @@ checkpoint = "checkpoints/predict.pt"
     assert payload["config"]["predict"]["checkpoint"] == str(tmp_path / "checkpoints/predict.pt")
 
 
-def test_outlier_detect_raw_to_parquet_cli_dispatches(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    from outlierdetect import cli
-
-    captured = {}
-
-    def fake_write_argo_parquet(root, output, *, pattern="**/*.nc", good_qc_only=True, min_levels=5):
-        captured["root"] = root
-        captured["output"] = output
-        captured["pattern"] = pattern
-        captured["good_qc_only"] = good_qc_only
-        captured["min_levels"] = min_levels
-        return SimpleNamespace(
-            as_dict=lambda: {
-                "output": str(output),
-                "n_files": 1,
-                "n_profiles": 1,
-                "n_rows": 2,
-            }
-        )
-
-    monkeypatch.setattr("outlierdetect.parquet.write_argo_parquet", fake_write_argo_parquet)
-
-    input_dir = tmp_path / "argo"
-    output = tmp_path / "out" / "argo.parquet"
-    cli.main(
-        [
-            "--raw-to-parquet",
-            "--input",
-            str(input_dir),
-            "--output",
-            str(output),
-            "--pattern",
-            "**/profiles/*.nc",
-            "--min-levels",
-            "7",
-            "--no-good-qc-only",
-        ]
-    )
-
-    assert captured["root"] == str(input_dir)
-    assert captured["output"] == output
-    assert captured["pattern"] == "**/profiles/*.nc"
-    assert captured["good_qc_only"] is False
-    assert captured["min_levels"] == 7
-
-
-def test_build_argo_synthetic_examples_accepts_parquet_path(tmp_path, monkeypatch):
-    import pandas as pd
-
-    from outlierdetect.training.argo import build_argo_synthetic_examples
-
-    df = pd.DataFrame(
-        [
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "n_levels": 5,
-                "level_index": 0,
-                "pressure": 0.0,
-                "temperature": 5.0,
-                "salinity": 34.0,
-            },
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "n_levels": 5,
-                "level_index": 1,
-                "pressure": 10.0,
-                "temperature": 4.8,
-                "salinity": 34.05,
-            },
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "n_levels": 5,
-                "level_index": 2,
-                "pressure": 20.0,
-                "temperature": 4.5,
-                "salinity": 34.1,
-            },
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "n_levels": 5,
-                "level_index": 3,
-                "pressure": 30.0,
-                "temperature": 4.2,
-                "salinity": 34.15,
-            },
-            {
-                "source_file": "a.nc",
-                "profile_index_in_file": 0,
-                "profile_id": "a_001",
-                "float_wmo": "5900001",
-                "cycle_number": 1,
-                "juld": 12345.0,
-                "n_levels": 5,
-                "level_index": 4,
-                "pressure": 40.0,
-                "temperature": 4.0,
-                "salinity": 34.2,
-            },
-        ]
-    )
-
-    monkeypatch.setattr(pd, "read_parquet", lambda path: df)
-
-    synth = build_argo_synthetic_examples(
-        str(tmp_path / "dataset.parquet"),
-        n_examples_per_profile=1,
-        n_levels=5,
-        grid_size=8,
-        seed=2,
-        min_levels=5,
-    )
-
-    assert len(synth) == 1
-    assert synth[0].example.profile.profile_id == "a_001"
-    assert synth[0].example.profile.pressure.size == 5
-
-
-def test_predict_loader_accepts_parquet_path(monkeypatch, tmp_path):
-    from outlierdetect import cli
-    from outlierdetect.argo import ArgoProfile
-
-    captured = {}
-
-    def fake_iter_parquet(path, min_levels=5):
-        captured["path"] = path
-        captured["min_levels"] = min_levels
-        return [
-            ArgoProfile(
-                profile_id="pred_001",
-                pressure=np.array([0.0, 10.0, 20.0], dtype=float),
-                temperature=np.array([5.0, 4.7, 4.4], dtype=float),
-                salinity=np.array([34.0, 34.1, 34.2], dtype=float),
-            )
-        ]
-
-    monkeypatch.setattr(cli, "iter_argo_parquet_profiles", fake_iter_parquet)
-    monkeypatch.setattr(cli, "iter_argo_files", lambda *args, **kwargs: [])
-
-    profiles = cli._load_prediction_profiles(tmp_path / "profiles.parquet", min_levels=7)
-
-    assert captured["path"] == tmp_path / "profiles.parquet"
-    assert captured["min_levels"] == 7
-    assert len(profiles) == 1
-
-
 def test_training_run_writer_updates_progress_each_epoch(tmp_path, monkeypatch):
     import torch
 
@@ -1687,6 +1426,10 @@ def test_train_main_writes_epoch_progress(tmp_path, monkeypatch):
         optimizer=None,
         learning_rate=1e-3,
         epoch_callback=None,
+        progress=True,
+        normalization_accumulator=None,
+        normalization_callback=None,
+        **kwargs,
     ):
         history = [{"train_total": 1.0, "epoch": 1.0}]
         if epoch_callback is not None:
@@ -1784,6 +1527,10 @@ def test_train_main_uses_test_root_without_augment(tmp_path, monkeypatch):
         optimizer=None,
         learning_rate=1e-3,
         epoch_callback=None,
+        progress=True,
+        normalization_accumulator=None,
+        normalization_callback=None,
+        **kwargs,
     ):
         captured["train_ids"] = [ex.profile.profile_id for ex in train_loader.dataset.examples]
         captured["val_loader_none"] = val_loader is None
@@ -1889,6 +1636,10 @@ def test_train_main_uses_test_root_with_augment(tmp_path, monkeypatch):
         optimizer=None,
         learning_rate=1e-3,
         epoch_callback=None,
+        progress=True,
+        normalization_accumulator=None,
+        normalization_callback=None,
+        **kwargs,
     ):
         captured["train_ids"] = [ex.profile.profile_id for ex in train_loader.dataset.examples]
         captured["val_loader_none"] = val_loader is None

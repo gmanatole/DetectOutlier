@@ -107,6 +107,85 @@ class NormalizationStats:
         return np.asarray(values, dtype=float) * self.salinity_scale + self.salinity_mean
 
 
+@dataclass(slots=True)
+class NormalizationAccumulator:
+    """Incrementally accumulate temperature/salinity moments."""
+
+    temperature_sum: float = 0.0
+    temperature_sumsq: float = 0.0
+    temperature_count: int = 0
+    salinity_sum: float = 0.0
+    salinity_sumsq: float = 0.0
+    salinity_count: int = 0
+
+    def update(
+        self,
+        *,
+        temperature: ArrayLike | None = None,
+        salinity: ArrayLike | None = None,
+    ) -> None:
+        """Accumulate finite temperature/salinity values from one batch."""
+
+        if temperature is not None:
+            temp = np.asarray(temperature, dtype=float).ravel()
+            temp = temp[np.isfinite(temp)]
+            if temp.size:
+                self.temperature_sum += float(np.sum(temp))
+                self.temperature_sumsq += float(np.sum(temp * temp))
+                self.temperature_count += int(temp.size)
+        if salinity is not None:
+            sal = np.asarray(salinity, dtype=float).ravel()
+            sal = sal[np.isfinite(sal)]
+            if sal.size:
+                self.salinity_sum += float(np.sum(sal))
+                self.salinity_sumsq += float(np.sum(sal * sal))
+                self.salinity_count += int(sal.size)
+
+    def update_from_reconstruction(self, values: ArrayLike | None) -> None:
+        """Accumulate from a ``[..., 2]`` reconstruction target or batch."""
+
+        if values is None:
+            return
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim < 2 or arr.shape[-1] < 2:
+            raise ValueError(f"Expected a tensor with a trailing T/S dimension, got shape {arr.shape}.")
+        self.update(temperature=arr[..., 0], salinity=arr[..., 1])
+
+    def update_from_profile(self, profile: Any) -> None:
+        """Accumulate from a profile-like object."""
+
+        if profile is None:
+            return
+        temp = getattr(profile, "temperature", None)
+        sal = getattr(profile, "salinity", None)
+        if temp is None or sal is None:
+            return
+        self.update(temperature=temp, salinity=sal)
+
+    def to_stats(self) -> NormalizationStats:
+        """Convert the accumulated moments into a :class:`NormalizationStats`."""
+
+        if self.temperature_count <= 0 or self.salinity_count <= 0:
+            raise ValueError("Cannot compute normalization stats from an empty accumulator.")
+
+        t_mean = self.temperature_sum / float(self.temperature_count)
+        s_mean = self.salinity_sum / float(self.salinity_count)
+        t_var = max(self.temperature_sumsq / float(self.temperature_count) - t_mean * t_mean, 0.0)
+        s_var = max(self.salinity_sumsq / float(self.salinity_count) - s_mean * s_mean, 0.0)
+        t_std = float(np.sqrt(t_var))
+        s_std = float(np.sqrt(s_var))
+        if not np.isfinite(t_std) or t_std <= 0:
+            t_std = 1.0
+        if not np.isfinite(s_std) or s_std <= 0:
+            s_std = 1.0
+        return NormalizationStats(
+            temperature_mean=float(t_mean),
+            temperature_std=t_std,
+            salinity_mean=float(s_mean),
+            salinity_std=s_std,
+        )
+
+
 def _to_1d_float(name: str, values: ArrayLike | None, n: int | None = None) -> FloatArray | None:
     if values is None:
         return None

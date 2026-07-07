@@ -39,6 +39,42 @@ class ProfileExample:
     labels: ProfileLabels = field(default_factory=ProfileLabels)
 
 
+def profile_example_to_sample(
+    ex: ProfileExample,
+    norm: NormalizationStats | dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Convert a labeled profile example into a collatable sample dictionary."""
+
+    normalization = NormalizationStats.from_mapping(norm)
+    feats = build_level_features(ex.profile, normalization=normalization)
+    labels = ex.labels
+    point_labels = _stack_point_labels(labels, ex.profile.n_levels)
+    recon_truth = _stack_reconstruction(labels)
+    recon_truth_physical = None if recon_truth is None else np.asarray(recon_truth, dtype=float)
+    if recon_truth is not None and normalization is not None:
+        recon_truth = np.column_stack(
+            [
+                normalization.normalize_temperature(recon_truth[:, 0]),
+                normalization.normalize_salinity(recon_truth[:, 1]),
+            ]
+        ).astype("float32")
+    sample = {
+        "features": feats.level_features.astype("float32"),
+        "mask": feats.mask.astype(bool),
+        "feature_names": feats.feature_names,
+        "profile_bad": _optional_scalar(labels.profile_bad),
+        "point_labels": point_labels.astype("float32"),
+        "point_label_mask": np.isfinite(point_labels).all(axis=-1),
+        "nuisance_mean": _optional_array(labels.nuisance_mean, shape=(4,)),
+        "recon_truth": recon_truth,
+        "recon_truth_physical": recon_truth_physical,
+        "pressure_grid": labels.pressure_grid,
+        "profile_id": ex.profile.profile_id,
+        "norm_stats": None if normalization is None else normalization.as_dict(),
+    }
+    return sample
+
+
 class ProfileDataset(TorchDataset):
     """Dataset of ProfileExample objects.
 
@@ -60,34 +96,7 @@ class ProfileDataset(TorchDataset):
         return len(self.examples)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        ex = self.examples[index]
-        feats = build_level_features(ex.profile, normalization=self.norm)
-        labels = ex.labels
-        point_labels = _stack_point_labels(labels, ex.profile.n_levels)
-        recon_truth = _stack_reconstruction(labels)
-        recon_truth_physical = None if recon_truth is None else np.asarray(recon_truth, dtype=float)
-        if recon_truth is not None and self.norm is not None:
-            recon_truth = np.column_stack(
-                [
-                    self.norm.normalize_temperature(recon_truth[:, 0]),
-                    self.norm.normalize_salinity(recon_truth[:, 1]),
-                ]
-            ).astype("float32")
-        sample = {
-            "features": feats.level_features.astype("float32"),
-            "mask": feats.mask.astype(bool),
-            "feature_names": feats.feature_names,
-            "profile_bad": _optional_scalar(labels.profile_bad),
-            "point_labels": point_labels.astype("float32"),
-            "point_label_mask": np.isfinite(point_labels).all(axis=-1),
-            "nuisance_mean": _optional_array(labels.nuisance_mean, shape=(4,)),
-            "recon_truth": recon_truth,
-            "recon_truth_physical": recon_truth_physical,
-            "pressure_grid": labels.pressure_grid,
-            "profile_id": ex.profile.profile_id,
-            "norm_stats": None if self.norm is None else self.norm.as_dict(),
-        }
-        return sample
+        return profile_example_to_sample(self.examples[index], norm=self.norm)
 
 
 def collate_profiles(batch: list[dict[str, Any]]) -> dict[str, Any]:

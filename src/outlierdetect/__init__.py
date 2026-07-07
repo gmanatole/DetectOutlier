@@ -8,10 +8,9 @@ for CTD-SRDL-style quality control and reconstruction.
 from .argo import ArgoProfile, GOOD_QC_FLAGS, iter_argo_files, read_argo_file, sample_pressure_indices, subsample_profile
 from .en4 import iter_en4_files, read_en4_file
 from .corrections import CorrectionPosterior, CorrectionPrior
-from .data import NormalizationStats, NuisanceBias, ProfileInput, Result
+from .data import NormalizationAccumulator, NormalizationStats, NuisanceBias, ProfileInput, Result
 from .features import FeatureBatch, build_level_features, linear_detrend, robust_linear_detrend
 from .model import Net, NetConfig, ProfileNet, ProfileNetConfig
-from .parquet import ArgoParquetSummary, argo_directory_to_dataframe, collect_nc_paths, write_argo_parquet
 from .runtime_config import (
     AppConfig,
     HeaveConfig,
@@ -50,14 +49,19 @@ from .training import (
     load_checkpoint,
     load_model_from_checkpoint,
     loss,
+    list_source_files,
+    make_training_example_factory,
+    profile_example_to_sample,
+    preview_stream_examples,
     save_checkpoint,
+    split_source_files,
+    StreamingProfileDataset,
     train_epoch,
 )
 
 __all__ = [
     "ArgoProfile",
     "ArgoTrainingConfig",
-    "ArgoParquetSummary",
     "AppConfig",
     "CorrectionPosterior",
     "CorrectionPrior",
@@ -78,6 +82,7 @@ __all__ = [
     "Neural",
     "NuisanceBias",
     "NormalizationStats",
+    "NormalizationAccumulator",
     "GOOD_QC_FLAGS",
     "PredictConfig",
     "ProfileInput",
@@ -90,6 +95,7 @@ __all__ = [
     "ProfileDataset",
     "ProfileExample",
     "ProfileLabels",
+    "profile_example_to_sample",
     "build_argo_dataset",
     "build_argo_examples",
     "build_argo_synthetic_examples",
@@ -97,7 +103,6 @@ __all__ = [
     "build_en4_examples",
     "build_en4_synthetic_examples",
     "compute_normalization_stats",
-    "argo_directory_to_dataframe",
     "build_level_features",
     "collate",
     "collate_profiles",
@@ -105,9 +110,13 @@ __all__ = [
     "degrade_highres_profile",
     "eval_epoch",
     "fit_model",
+    "StreamingProfileDataset",
+    "list_source_files",
+    "make_training_example_factory",
+    "preview_stream_examples",
+    "split_source_files",
     "iter_argo_files",
     "iter_en4_files",
-    "collect_nc_paths",
     "load_checkpoint",
     "load_model_from_checkpoint",
     "linear_detrend",
@@ -117,7 +126,6 @@ __all__ = [
     "robust_linear_detrend",
     "sample_pressure_indices",
     "save_checkpoint",
-    "write_argo_parquet",
     "subsample_profile",
     "train_epoch",
 ]

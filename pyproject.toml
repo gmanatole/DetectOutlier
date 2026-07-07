@@ -40,7 +40,7 @@ io = [
 ]
 train = [
   "matplotlib>=3.8",
-  "torch>=2.1",
+  "torch==2.8.0",
   "tqdm>=4.66",
 ]
 dev = [

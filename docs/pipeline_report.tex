@@ -36,7 +36,7 @@ This report describes the current pipeline in the repository as it exists now, i
 \section{End-to-End Pipeline}
 At a high level, the system moves through these stages:
 \begin{enumerate}[leftmargin=*]
-  \item Read a profile source from NetCDF or parquet.
+  \item Read a profile source from NetCDF.
   \item Convert it into a \code{ProfileInput} object with pressure, temperature, salinity, optional residuals, uncertainty scales, and metadata.
   \item Build per-level physical and statistical features, including density diagnostics and nuisance-correction features.
   \item Run either the heuristic baseline or the neural model to obtain profile-level and point-level outlier probabilities.
@@ -133,9 +133,6 @@ That raw mode is what the held-out test root now uses.
 \path{src/outlierdetect/en4.py} does the same job for EN4 monthly files, but with EN4-specific variable discovery. It selects pressure, temperature, and salinity from the candidate names exposed by the dataset and can also operate in raw mode for held-out evaluation.
 
 The key point is that EN4 is normalized into the same \code{ArgoProfile} shape, which keeps the downstream synthetic builder source-agnostic.
-
-\subsection{\code{parquet.py}}
-\path{src/outlierdetect/parquet.py} provides raw data export and iteration over parquet-backed profile data. This is useful when you want to stage NetCDF data once and then iterate over a lighter-weight representation later. It sits outside the core physical pipeline, but it is part of the ingest path.
 
 \section{Physics, Corrections, and Feature Construction}
 \subsection{\code{density.py}}
@@ -360,7 +357,7 @@ The top-level CLI also exposes config management:
   \item \code{outlierdetect config validate}
 \end{itemize}
 
-Other workflow flags include raw-to-parquet export, prediction, training, optional heave source selection, and input toggles for residuals, uncertainty scales, and seasonal phase. Prediction still uses \code{--argo-root}, because that flag names the inference input root. Training now uses \code{--train-root}.
+Other workflow flags include prediction, training, optional heave source selection, and input toggles for residuals, uncertainty scales, and seasonal phase. Prediction still uses \code{--argo-root}, because that flag names the inference input root. Training now uses \code{--train-root}.
 
 \section{Artifacts and Run Outputs}
 \subsection{\code{training/artifacts.py}}
@@ -393,7 +390,6 @@ Module & Role & Key objects / functions \\
 \path{src/outlierdetect/netcdf_backend.py} & Low-level file opening & backend selection helpers for NetCDF/HDF5 access \\
 \path{src/outlierdetect/argo.py} & Argo profile reading & \code{ArgoProfile}, \code{read\_argo\_file}, \code{iter\_argo\_files} \\
 \path{src/outlierdetect/en4.py} & EN4 profile reading & \code{read\_en4\_file}, \code{iter\_en4\_files} \\
-\path{src/outlierdetect/parquet.py} & Parquet staging/export & \code{write\_argo\_parquet}, \code{iter\_argo\_parquet\_profiles} \\
 \path{src/outlierdetect/tool.py} & Inference wrappers & \code{Heuristic}, \code{Neural}, \code{Config} \\
 \path{src/outlierdetect/model.py} & Transformer network & \code{NetConfig}, \code{Net}, \code{masked\_mean} \\
 \path{src/outlierdetect/runtime_config.py} & TOML and path resolution & \code{AppConfig}, \code{TrainConfig}, \code{PredictConfig}, loaders \\

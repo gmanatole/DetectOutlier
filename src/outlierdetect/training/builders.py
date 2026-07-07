@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +11,7 @@ from outlierdetect.argo import ArgoProfile, sample_pressure_indices
 from outlierdetect.training.synthetic import SyntheticExample, degrade_highres_profile
 
 
-def build_synthetic_examples_from_profiles(
+def iter_synthetic_examples_from_profiles(
     profiles: Iterable[ArgoProfile],
     *,
     source_name: str,
@@ -24,7 +24,7 @@ def build_synthetic_examples_from_profiles(
     seed: int | None = None,
     upper_ocean_bias: float = 1.7,
     reference_source: bool | str | Path | None = None,
-) -> list[SyntheticExample]:
+) -> Iterator[SyntheticExample]:
     """Convert clean profiles into synthetic training examples.
 
     When ``profile_limit`` is set, the builder first filters out profiles that
@@ -34,7 +34,6 @@ def build_synthetic_examples_from_profiles(
     """
 
     rng = np.random.default_rng(seed)
-    examples: list[SyntheticExample] = []
     min_levels_required = max(min_levels, 5)
 
     if profile_limit is None:
@@ -97,6 +96,13 @@ def build_synthetic_examples_from_profiles(
                     "longitude": profile.longitude,
                 }
             )
-            examples.append(synth)
+            yield synth
 
-    return examples
+
+def build_synthetic_examples_from_profiles(
+    profiles: Iterable[ArgoProfile],
+    **kwargs: object,
+) -> list[SyntheticExample]:
+    """Materialize synthetic examples from clean profiles."""
+
+    return list(iter_synthetic_examples_from_profiles(profiles, **kwargs))

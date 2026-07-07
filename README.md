@@ -71,12 +71,6 @@ Predict on a dataset:
 outlierdetect-predict --config outlierdetect.toml
 ```
 
-Export raw Argo profiles to parquet:
-
-```bash
-outlier-detect --raw-to-parquet --input C:\data\argo --output C:\data\argo.parquet
-```
-
 ## Documentation
 
 The Sphinx tree is the authoritative reference for the codebase:

@@ -76,6 +76,7 @@ class TrainConfig:
     train_root: str | Path | None = None
     test_root: str | Path | None = None
     data_source: str = "argo"
+    training_mode: str = "preload"
     profile_type: str = "adjusted"
     raw_fallback: bool = False
     output: str | Path | None = None
@@ -87,7 +88,7 @@ class TrainConfig:
     grid_size: int = 80
     upper_ocean_bias: float = 1.7
     epochs: int = 5
-    batch_size: int = 8
+    batch_size: int = 64
     learning_rate: float = 1e-3
     val_fraction: float = 0.1
     device: str = "cpu"
@@ -171,6 +172,7 @@ def load_app_config(path: str | Path | None = None) -> AppConfig:
     _merge_section(config.predict, predict_values)
     config.source_path = config_path
     _resolve_config_paths(config, base_dir=config_path.parent)
+    config.train.training_mode = _normalize_training_mode(config.train.training_mode)
     config.train.profile_type = _normalize_profile_type(config.train.profile_type)
     config.predict.profile_type = _normalize_profile_type(config.predict.profile_type)
     config.train.reference = _normalize_reference_mode(config.train.reference)
@@ -219,6 +221,7 @@ def example_app_config() -> AppConfig:
     config.train.train_root = "data"
     config.train.test_root = None
     config.train.data_source = "argo"
+    config.train.training_mode = "preload"
     config.train.profile_type = "adjusted"
     config.train.raw_fallback = False
     config.train.output = "checkpoints/train_dataset_20ep.pt"
@@ -310,6 +313,7 @@ def train_parser_defaults(config: AppConfig) -> dict[str, Any]:
         "train_root": _first_path(config.train.train_root, config.paths.data_root),
         "test_root": config.train.test_root,
         "data_source": config.train.data_source,
+        "training_mode": config.train.training_mode,
         "profile_type": config.train.profile_type,
         "raw_fallback": config.train.raw_fallback,
         "output": _first_path(config.train.output, config.paths.model_checkpoint),
@@ -545,6 +549,15 @@ def _normalize_profile_type(value: str | None) -> str:
     mode = str(value).strip().lower()
     if mode not in {"adjusted", "raw"}:
         raise ValueError("profile_type must be either 'adjusted' or 'raw'.")
+    return mode
+
+
+def _normalize_training_mode(value: str | None) -> str:
+    if value is None:
+        return "preload"
+    mode = str(value).strip().lower()
+    if mode not in {"preload", "stream"}:
+        raise ValueError("training_mode must be either 'preload' or 'stream'.")
     return mode
 
 
