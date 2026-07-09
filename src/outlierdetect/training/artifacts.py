@@ -223,6 +223,7 @@ class TrainingRunWriter:
         *,
         history: list[dict[str, float]],
         checkpoint_path: str | Path | None = None,
+        checkpoint_paths: dict[str, str | Path] | None = None,
     ) -> dict[str, Any]:
         """Mark the run as complete and persist the final progress snapshot."""
         self._progress.update(
@@ -234,6 +235,12 @@ class TrainingRunWriter:
         )
         if checkpoint_path is not None:
             self._progress["checkpoint_path"] = str(Path(checkpoint_path))
+        if checkpoint_paths is not None:
+            self._progress["checkpoint_paths"] = {
+                str(key): str(Path(value)) for key, value in checkpoint_paths.items()
+            }
+        elif checkpoint_path is not None:
+            self._progress["checkpoint_paths"] = {"final": str(Path(checkpoint_path))}
         self._write_progress()
         return dict(self._progress)
 

@@ -12,11 +12,12 @@ import json
 import sys
 from pathlib import Path
 import warnings
+from typing import Callable
 
 import numpy as np
 
 from .argo import ArgoProfile, iter_argo_files
-from .data import NormalizationAccumulator
+from .data import NormalizationAccumulator, NormalizationStats
 from .en4 import iter_en4_files
 from .runtime_config import (
     AppConfig,
@@ -203,6 +204,110 @@ def _split_examples(examples: list[object], val_fraction: float, seed: int) -> t
     train = [ex for i, ex in enumerate(examples) if i not in val_idx]
     val = [ex for i, ex in enumerate(examples) if i in val_idx]
     return train, val
+
+
+def _checkpoint_variant_path(path: str | Path, label: str) -> Path:
+    """Return a sibling checkpoint path with a descriptive suffix."""
+
+    base = Path(path)
+    suffix = "".join(base.suffixes)
+    stem = base.name[: -len(suffix)] if suffix else base.name
+    return base.with_name(f"{stem}.{label}{suffix}")
+
+
+def _checkpoint_score(
+    history: list[dict[str, float]],
+    *,
+    eval_label: str,
+    metrics: tuple[str, ...],
+) -> float | None:
+    """Compute the latest monitored validation score from a training history."""
+
+    if not history:
+        return None
+    prefix = str(eval_label).strip() or "val"
+    latest = history[-1]
+    score = 0.0
+    seen = False
+    for metric in metrics:
+        value = latest.get(f"{prefix}_{metric}")
+        if value is None:
+            return None
+        score += float(value)
+        seen = True
+    return score if seen else None
+
+
+def _best_detection_checkpoint_score(history: list[dict[str, float]], *, eval_label: str) -> float | None:
+    """Return the score used to select the best detection checkpoint."""
+
+    return _checkpoint_score(history, eval_label=eval_label, metrics=("profile_qc", "point_qc"))
+
+
+def _best_nuisance_checkpoint_score(history: list[dict[str, float]], *, eval_label: str) -> float | None:
+    """Return the score used to select the best nuisance checkpoint."""
+
+    return _checkpoint_score(history, eval_label=eval_label, metrics=("nuisance",))
+
+
+def _save_best_checkpoint(
+    *,
+    path: Path | None,
+    score: float | None,
+    best_score: float | None,
+    epoch: int,
+    best_epoch: int | None,
+    model: object,
+    metadata_builder: Callable[[int, float], dict[str, object]],
+) -> tuple[float | None, int | None, bool]:
+    """Save a checkpoint if the monitored score improved."""
+
+    if path is None or score is None:
+        return best_score, best_epoch, False
+    if best_score is None or score < best_score:
+        save_checkpoint(path, model, metadata=metadata_builder(epoch, score))
+        return score, epoch, True
+    return best_score, best_epoch, False
+
+
+def _checkpoint_metadata(
+    *,
+    input_dim: int,
+    grid_size: int,
+    min_levels: int,
+    n_examples: int | None,
+    seed: int,
+    upper_ocean_bias: float,
+    feature_names: list[str],
+    normalization: NormalizationStats | None,
+    run_config: dict[str, object],
+    checkpoint_role: str,
+    eval_label: str,
+    checkpoint_selection: dict[str, object] | None = None,
+    related_checkpoints: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Build the metadata stored alongside a checkpoint."""
+
+    metadata: dict[str, object] = {
+        "input_dim": int(input_dim),
+        "grid_size": int(grid_size),
+        "min_levels": int(min_levels),
+        "n_examples": n_examples,
+        "seed": int(seed),
+        "upper_ocean_bias": float(upper_ocean_bias),
+        "feature_names": list(feature_names),
+        "normalization": None if normalization is None else normalization.as_dict(),
+        "config": dict(run_config),
+        "checkpoint_role": str(checkpoint_role),
+        "eval_label": str(eval_label),
+    }
+    if checkpoint_selection is not None:
+        metadata["checkpoint_selection"] = dict(checkpoint_selection)
+    if related_checkpoints is not None:
+        metadata["related_checkpoints"] = {
+            str(key): dict(value) for key, value in related_checkpoints.items()
+        }
+    return metadata
 
 
 def config_main(argv: list[str] | None = None) -> None:
@@ -559,6 +664,7 @@ def train_main(argv: list[str] | None = None) -> None:
     args.run_root = _resolve_path_arg(args.run_root)
     args.sigma_heave_source = _resolve_sigma_heave_source(args.sigma_heave_source)
     reference_source = resolve_reference_source_mode(config.train.reference)
+    run_config = resolved_run_config_dict(config=config, command="train", args=args)
 
     try:
         from torch.utils.data import DataLoader
@@ -788,11 +894,103 @@ def train_main(argv: list[str] | None = None) -> None:
         )
         print(f"Training mode: {training_mode} (lazy file loading)")
         print(f"Writing training artifacts to {writer.run_dir}")
-        _save_run_config(writer.run_dir, resolved_run_config_dict(config=config, command="train", args=args))
+        _save_run_config(writer.run_dir, run_config)
 
         sample = ProfileDataset([train_preview[0]], norm=None)[0]
         model = Net(NetConfig(input_dim=sample["features"].shape[1], grid_size=args.grid_size))
         normalization_accumulator = NormalizationAccumulator()
+        best_detection_score: float | None = None
+        best_detection_epoch: int | None = None
+        best_nuisance_score: float | None = None
+        best_nuisance_epoch: int | None = None
+        final_checkpoint_path = args.output
+        best_detection_checkpoint_path = (
+            _checkpoint_variant_path(args.output, "best_detection") if args.output is not None else None
+        )
+        best_nuisance_checkpoint_path = (
+            _checkpoint_variant_path(args.output, "best_nuisance") if args.output is not None else None
+        )
+
+        def _stream_normalization() -> NormalizationStats | None:
+            try:
+                return normalization_accumulator.to_stats()
+            except ValueError:
+                return None
+
+        def _stream_metadata(
+            *,
+            checkpoint_role: str,
+            selection_epoch: int | None = None,
+            selection_score: float | None = None,
+            related_checkpoints: dict[str, dict[str, object]] | None = None,
+        ) -> dict[str, object]:
+            selection = None
+            if selection_epoch is not None and selection_score is not None:
+                selection = {
+                    "monitor": None,
+                    "best_epoch": int(selection_epoch),
+                    "best_score": float(selection_score),
+                }
+                if checkpoint_role == "best_detection":
+                    selection["monitor"] = f"{eval_label}_profile_qc + {eval_label}_point_qc"
+                elif checkpoint_role == "best_nuisance":
+                    selection["monitor"] = f"{eval_label}_nuisance"
+            return _checkpoint_metadata(
+                input_dim=sample["features"].shape[1],
+                grid_size=int(args.grid_size),
+                min_levels=int(args.min_levels),
+                n_examples=total_examples,
+                seed=int(args.seed),
+                upper_ocean_bias=float(args.upper_ocean_bias),
+                feature_names=list(sample["feature_names"]),
+                normalization=_stream_normalization(),
+                run_config=run_config,
+                checkpoint_role=checkpoint_role,
+                eval_label=eval_label,
+                checkpoint_selection=selection,
+                related_checkpoints=related_checkpoints,
+            )
+
+        def _epoch_callback(epoch: int, model: object, history: list[dict[str, float]]) -> None:
+            nonlocal best_detection_score, best_detection_epoch, best_nuisance_score, best_nuisance_epoch
+            writer.record_epoch(
+                epoch=epoch,
+                model=model,
+                history=history,
+                device=args.device,
+                n_train_examples=None,
+                n_val_examples=None,
+                eval_label=eval_label,
+            )
+            detection_score = _best_detection_checkpoint_score(history, eval_label=eval_label)
+            best_detection_score, best_detection_epoch, _ = _save_best_checkpoint(
+                path=best_detection_checkpoint_path,
+                score=detection_score,
+                best_score=best_detection_score,
+                epoch=epoch,
+                best_epoch=best_detection_epoch,
+                model=model,
+                metadata_builder=lambda best_epoch, best_score: _stream_metadata(
+                    checkpoint_role="best_detection",
+                    selection_epoch=best_epoch,
+                    selection_score=best_score,
+                ),
+            )
+            nuisance_score = _best_nuisance_checkpoint_score(history, eval_label=eval_label)
+            best_nuisance_score, best_nuisance_epoch, _ = _save_best_checkpoint(
+                path=best_nuisance_checkpoint_path,
+                score=nuisance_score,
+                best_score=best_nuisance_score,
+                epoch=epoch,
+                best_epoch=best_nuisance_epoch,
+                model=model,
+                metadata_builder=lambda best_epoch, best_score: _stream_metadata(
+                    checkpoint_role="best_nuisance",
+                    selection_epoch=best_epoch,
+                    selection_score=best_score,
+                ),
+            )
+
         history = fit_model(
             model,
             train_loader,
@@ -804,34 +1002,50 @@ def train_main(argv: list[str] | None = None) -> None:
             progress=True,
             normalization_accumulator=normalization_accumulator,
             normalization_callback=writer.set_normalization,
-            epoch_callback=lambda epoch, model, history: writer.record_epoch(
-                epoch=epoch,
-                model=model,
-                history=history,
-                device=args.device,
-                n_train_examples=None,
-                n_val_examples=None,
-                eval_label=eval_label,
-            ),
+            epoch_callback=_epoch_callback,
         )
 
-        if args.output is not None:
+        related_checkpoints: dict[str, dict[str, object]] = {}
+        checkpoint_paths: dict[str, Path] = {}
+        if final_checkpoint_path is not None:
+            checkpoint_paths["final"] = final_checkpoint_path
+        if (
+            best_detection_checkpoint_path is not None
+            and best_detection_epoch is not None
+            and best_detection_score is not None
+        ):
+            checkpoint_paths["best_detection"] = best_detection_checkpoint_path
+            related_checkpoints["best_detection"] = {
+                "path": str(best_detection_checkpoint_path),
+                "epoch": int(best_detection_epoch),
+                "score": float(best_detection_score),
+            }
+        if (
+            best_nuisance_checkpoint_path is not None
+            and best_nuisance_epoch is not None
+            and best_nuisance_score is not None
+        ):
+            checkpoint_paths["best_nuisance"] = best_nuisance_checkpoint_path
+            related_checkpoints["best_nuisance"] = {
+                "path": str(best_nuisance_checkpoint_path),
+                "epoch": int(best_nuisance_epoch),
+                "score": float(best_nuisance_score),
+            }
+
+        if final_checkpoint_path is not None:
             save_checkpoint(
-                args.output,
+                final_checkpoint_path,
                 model,
-                metadata={
-                    "input_dim": int(sample["features"].shape[1]),
-                    "grid_size": int(args.grid_size),
-                    "min_levels": int(args.min_levels),
-                    "n_examples": total_examples,
-                    "seed": int(args.seed),
-                    "upper_ocean_bias": float(args.upper_ocean_bias),
-                    "feature_names": list(sample["feature_names"]),
-                    "normalization": None if normalization_accumulator is None else normalization_accumulator.to_stats().as_dict(),
-                    "config": resolved_run_config_dict(config=config, command="train", args=args),
-                },
+                metadata=_stream_metadata(
+                    checkpoint_role="final",
+                    related_checkpoints=related_checkpoints or None,
+                ),
             )
-        writer.finalize(history=history, checkpoint_path=args.output)
+        writer.finalize(
+            history=history,
+            checkpoint_path=final_checkpoint_path,
+            checkpoint_paths=checkpoint_paths or None,
+        )
 
         summary = {
             "run_dir": str(writer.run_dir),
@@ -841,6 +1055,11 @@ def train_main(argv: list[str] | None = None) -> None:
             "n_train": None,
             "n_eval_examples": None,
             "eval_label": eval_label,
+            "best_detection_checkpoint_epoch": best_detection_epoch,
+            "best_detection_checkpoint_score": best_detection_score,
+            "best_nuisance_checkpoint_epoch": best_nuisance_epoch,
+            "best_nuisance_checkpoint_score": best_nuisance_score,
+            "checkpoint_paths": {key: str(value) for key, value in checkpoint_paths.items()},
             "history": history,
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -900,10 +1119,97 @@ def train_main(argv: list[str] | None = None) -> None:
     )
     print(f"Training mode: {training_mode} (preload into RAM)")
     print(f"Writing training artifacts to {writer.run_dir}")
-    _save_run_config(writer.run_dir, resolved_run_config_dict(config=config, command="train", args=args))
+    _save_run_config(writer.run_dir, run_config)
 
     sample = train_dataset[0]
     model = Net(NetConfig(input_dim=sample["features"].shape[1], grid_size=args.grid_size))
+    best_detection_score: float | None = None
+    best_detection_epoch: int | None = None
+    best_nuisance_score: float | None = None
+    best_nuisance_epoch: int | None = None
+    final_checkpoint_path = args.output
+    best_detection_checkpoint_path = (
+        _checkpoint_variant_path(args.output, "best_detection") if args.output is not None else None
+    )
+    best_nuisance_checkpoint_path = (
+        _checkpoint_variant_path(args.output, "best_nuisance") if args.output is not None else None
+    )
+
+    def _preload_metadata(
+        *,
+        checkpoint_role: str,
+        selection_epoch: int | None = None,
+        selection_score: float | None = None,
+        related_checkpoints: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        selection = None
+        if selection_epoch is not None and selection_score is not None:
+            selection = {
+                "monitor": None,
+                "best_epoch": int(selection_epoch),
+                "best_score": float(selection_score),
+            }
+            if checkpoint_role == "best_detection":
+                selection["monitor"] = f"{eval_label}_profile_qc + {eval_label}_point_qc"
+            elif checkpoint_role == "best_nuisance":
+                selection["monitor"] = f"{eval_label}_nuisance"
+        return _checkpoint_metadata(
+            input_dim=sample["features"].shape[1],
+            grid_size=int(args.grid_size),
+            min_levels=int(args.min_levels),
+            n_examples=total_examples,
+            seed=int(args.seed),
+            upper_ocean_bias=float(args.upper_ocean_bias),
+            feature_names=list(sample["feature_names"]),
+            normalization=norm,
+            run_config=run_config,
+            checkpoint_role=checkpoint_role,
+            eval_label=eval_label,
+            checkpoint_selection=selection,
+            related_checkpoints=related_checkpoints,
+        )
+
+    def _epoch_callback(epoch: int, model: object, history: list[dict[str, float]]) -> None:
+        nonlocal best_detection_score, best_detection_epoch, best_nuisance_score, best_nuisance_epoch
+        writer.record_epoch(
+            epoch=epoch,
+            model=model,
+            history=history,
+            device=args.device,
+            n_train_examples=len(train_examples),
+            n_val_examples=len(eval_examples),
+            eval_label=eval_label,
+        )
+        detection_score = _best_detection_checkpoint_score(history, eval_label=eval_label)
+        best_detection_score, best_detection_epoch, _ = _save_best_checkpoint(
+            path=best_detection_checkpoint_path,
+            score=detection_score,
+            best_score=best_detection_score,
+            epoch=epoch,
+            best_epoch=best_detection_epoch,
+            model=model,
+            metadata_builder=lambda best_epoch, best_score: _preload_metadata(
+                checkpoint_role="best_detection",
+                selection_epoch=best_epoch,
+                selection_score=best_score,
+            ),
+        )
+
+        nuisance_score = _best_nuisance_checkpoint_score(history, eval_label=eval_label)
+        best_nuisance_score, best_nuisance_epoch, _ = _save_best_checkpoint(
+            path=best_nuisance_checkpoint_path,
+            score=nuisance_score,
+            best_score=best_nuisance_score,
+            epoch=epoch,
+            best_epoch=best_nuisance_epoch,
+            model=model,
+            metadata_builder=lambda best_epoch, best_score: _preload_metadata(
+                checkpoint_role="best_nuisance",
+                selection_epoch=best_epoch,
+                selection_score=best_score,
+            ),
+        )
+
     history = fit_model(
         model,
         train_loader,
@@ -913,34 +1219,50 @@ def train_main(argv: list[str] | None = None) -> None:
         learning_rate=args.learning_rate,
         device=args.device,
         progress=True,
-        epoch_callback=lambda epoch, model, history: writer.record_epoch(
-            epoch=epoch,
-            model=model,
-            history=history,
-            device=args.device,
-            n_train_examples=len(train_examples),
-            n_val_examples=len(eval_examples),
-            eval_label=eval_label,
-        ),
+        epoch_callback=_epoch_callback,
     )
 
-    if args.output is not None:
+    related_checkpoints: dict[str, dict[str, object]] = {}
+    checkpoint_paths: dict[str, Path] = {}
+    if final_checkpoint_path is not None:
+        checkpoint_paths["final"] = final_checkpoint_path
+    if (
+        best_detection_checkpoint_path is not None
+        and best_detection_epoch is not None
+        and best_detection_score is not None
+    ):
+        checkpoint_paths["best_detection"] = best_detection_checkpoint_path
+        related_checkpoints["best_detection"] = {
+            "path": str(best_detection_checkpoint_path),
+            "epoch": int(best_detection_epoch),
+            "score": float(best_detection_score),
+        }
+    if (
+        best_nuisance_checkpoint_path is not None
+        and best_nuisance_epoch is not None
+        and best_nuisance_score is not None
+    ):
+        checkpoint_paths["best_nuisance"] = best_nuisance_checkpoint_path
+        related_checkpoints["best_nuisance"] = {
+            "path": str(best_nuisance_checkpoint_path),
+            "epoch": int(best_nuisance_epoch),
+            "score": float(best_nuisance_score),
+        }
+
+    if final_checkpoint_path is not None:
         save_checkpoint(
-            args.output,
+            final_checkpoint_path,
             model,
-            metadata={
-                "input_dim": int(sample["features"].shape[1]),
-                "grid_size": int(args.grid_size),
-                "min_levels": int(args.min_levels),
-                "n_examples": total_examples,
-                "seed": int(args.seed),
-                "upper_ocean_bias": float(args.upper_ocean_bias),
-                "feature_names": list(sample["feature_names"]),
-                "normalization": norm.as_dict(),
-                "config": resolved_run_config_dict(config=config, command="train", args=args),
-            },
+            metadata=_preload_metadata(
+                checkpoint_role="final",
+                related_checkpoints=related_checkpoints or None,
+            ),
         )
-    writer.finalize(history=history, checkpoint_path=args.output)
+    writer.finalize(
+        history=history,
+        checkpoint_path=final_checkpoint_path,
+        checkpoint_paths=checkpoint_paths or None,
+    )
 
     summary = {
         "run_dir": str(writer.run_dir),
@@ -950,6 +1272,11 @@ def train_main(argv: list[str] | None = None) -> None:
         "n_train": len(train_examples),
         "n_eval_examples": len(eval_examples),
         "eval_label": eval_label,
+        "best_detection_checkpoint_epoch": best_detection_epoch,
+        "best_detection_checkpoint_score": best_detection_score,
+        "best_nuisance_checkpoint_epoch": best_nuisance_epoch,
+        "best_nuisance_checkpoint_score": best_nuisance_score,
+        "checkpoint_paths": {key: str(value) for key, value in checkpoint_paths.items()},
         "history": history,
     }
     summary[f"n_{eval_label}"] = len(eval_examples)
