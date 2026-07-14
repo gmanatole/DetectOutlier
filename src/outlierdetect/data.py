@@ -480,27 +480,11 @@ class Result:
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly dictionary."""
-
-        def conv(value: Any) -> Any:
-            if isinstance(value, np.ndarray):
-                return value.tolist()
-            if isinstance(value, NuisanceBias):
-                return value.as_dict()
-            if hasattr(value, "as_dict") and callable(value.as_dict):
-                return value.as_dict()
-            if isinstance(value, dict):
-                return {k: conv(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [conv(v) for v in value]
-            if isinstance(value, np.generic):
-                return value.item()
-            return value
-
-        return {key: conv(getattr(self, key)) for key in self.__dataclass_fields__}
+        return {key: _jsonify_value(getattr(self, key)) for key in self.__dataclass_fields__}
 
     def summary(self) -> dict[str, Any]:
         """Compact summary useful for logs and dataframe rows."""
-        return {
+        summary = {
             "profile_id": self.profile_id,
             "profile_bad_probability": float(self.profile_bad_probability),
             "max_point_bad_t": float(np.nanmax(self.point_bad_t)),
@@ -522,6 +506,10 @@ class Result:
             if self.correction_posterior is None
             else float(getattr(self.correction_posterior, "information_gain", np.nan)),
         }
+        for key in ("nuisance_head_mean", "nuisance_head_std"):
+            if key in self.diagnostics:
+                summary[key] = _jsonify_value(self.diagnostics[key])
+        return summary
 
     def probability_dict(self) -> dict[str, Any]:
         """Return the profile and point outlier probabilities as JSON-friendly data."""
@@ -531,6 +519,12 @@ class Result:
             point_bad_t=self.point_bad_t,
             point_bad_s=self.point_bad_s,
             point_density_inconsistent=self.point_density_inconsistent,
+            extra={
+                key: self.diagnostics[key]
+                for key in ("nuisance_head_mean", "nuisance_head_std")
+                if key in self.diagnostics
+            }
+            or None,
         )
 
 
@@ -544,6 +538,7 @@ def probability_payload(
     plot_file: str | None = None,
     epoch: int | None = None,
     rank: int | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a JSON-friendly payload for saved profile probabilities."""
 
@@ -561,4 +556,25 @@ def probability_payload(
         payload["epoch"] = int(epoch)
     if rank is not None:
         payload["rank"] = int(rank)
+    if extra is not None:
+        for key, value in extra.items():
+            payload[str(key)] = _jsonify_value(value)
     return payload
+
+
+def _jsonify_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, NuisanceBias):
+        return value.as_dict()
+    if hasattr(value, "as_dict") and callable(value.as_dict):
+        return value.as_dict()
+    if isinstance(value, dict):
+        return {k: _jsonify_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonify_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonify_value(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value

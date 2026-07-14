@@ -132,6 +132,15 @@ class TrainingRunWriter:
                     point_weights_t=1.0 - np.maximum(point_bad_t, point_density_weight),
                     point_weights_s=1.0 - np.maximum(point_bad_s, point_density_weight),
                 )
+                nuisance_head_payload: dict[str, Any] = {}
+                nuisance_mean = outputs.get("nuisance_mean")
+                if nuisance_mean is not None:
+                    nuisance_head_payload["nuisance_head_mean"] = nuisance_mean[0].detach().cpu().numpy()
+                nuisance_log_std = outputs.get("nuisance_log_std")
+                if nuisance_log_std is not None:
+                    nuisance_head_payload["nuisance_head_std"] = np.exp(
+                        nuisance_log_std[0].detach().cpu().numpy()
+                    )
                 recon_temperature, recon_salinity = self._denormalize_reconstruction(
                     outputs["recon_mean"][0].detach().cpu().numpy()
                 )
@@ -164,6 +173,7 @@ class TrainingRunWriter:
                     plot_file=plot_rel,
                     epoch=epoch,
                     rank=rank,
+                    extra=nuisance_head_payload or None,
                 )
                 prediction_payload["nuisance_bias"] = correction_post.as_nuisance_bias().as_dict()
                 prediction_payload["correction_posterior"] = correction_post.as_dict()
@@ -181,6 +191,10 @@ class TrainingRunWriter:
                         "correction_information_gain": float(correction_post.information_gain),
                     }
                 )
+                if nuisance_head_payload:
+                    selected_profiles[-1].update(
+                        {key: np.asarray(value, dtype=float).tolist() for key, value in nuisance_head_payload.items()}
+                    )
         finally:
             if was_training:
                 model.train()
@@ -223,6 +237,7 @@ class TrainingRunWriter:
         *,
         history: list[dict[str, float]],
         checkpoint_path: str | Path | None = None,
+        checkpoint_paths: dict[str, str | Path] | None = None,
     ) -> dict[str, Any]:
         """Mark the run as complete and persist the final progress snapshot."""
         self._progress.update(
@@ -234,6 +249,12 @@ class TrainingRunWriter:
         )
         if checkpoint_path is not None:
             self._progress["checkpoint_path"] = str(Path(checkpoint_path))
+        if checkpoint_paths is not None:
+            self._progress["checkpoint_paths"] = {
+                str(key): str(Path(value)) for key, value in checkpoint_paths.items()
+            }
+        elif checkpoint_path is not None:
+            self._progress["checkpoint_paths"] = {"final": str(Path(checkpoint_path))}
         self._write_progress()
         return dict(self._progress)
 

@@ -1397,8 +1397,18 @@ def test_training_run_writer_updates_progress_each_epoch(tmp_path, monkeypatch):
             grid = 20
             profile = torch.zeros((batch,), dtype=features.dtype, device=features.device)
             point = torch.zeros((batch, grid, 3), dtype=features.dtype, device=features.device)
+            nuisance_mean = torch.zeros((batch, 4), dtype=features.dtype, device=features.device)
+            nuisance_log_std = torch.zeros((batch, 4), dtype=features.dtype, device=features.device)
             recon = torch.zeros((batch, grid, 2), dtype=features.dtype, device=features.device)
-            return {"profile_logit": profile, "point_logits": point, "recon_mean": recon}
+            recon_log_std = torch.zeros((batch, grid, 2), dtype=features.dtype, device=features.device)
+            return {
+                "profile_logit": profile,
+                "point_logits": point,
+                "nuisance_mean": nuisance_mean,
+                "nuisance_log_std": nuisance_log_std,
+                "recon_mean": recon,
+                "recon_log_std": recon_log_std,
+            }
 
     def fake_plot(self, path, **kwargs):
         path.write_text("plot", encoding="utf-8")
@@ -1428,6 +1438,8 @@ def test_training_run_writer_updates_progress_each_epoch(tmp_path, monkeypatch):
     assert len(payload["plot_files"]) == 1
     assert (writer.run_dir / payload["plot_files"][0]).exists()
     assert len(payload["selected_profiles"]) == 1
+    assert np.allclose(payload["selected_profiles"][0]["nuisance_head_mean"], 0.0)
+    assert np.allclose(payload["selected_profiles"][0]["nuisance_head_std"], 1.0)
     prediction_path = writer.run_dir / payload["selected_profiles"][0]["prediction_file"]
     assert prediction_path.exists()
     prediction = json.loads(prediction_path.read_text(encoding="utf-8"))
@@ -1435,6 +1447,8 @@ def test_training_run_writer_updates_progress_each_epoch(tmp_path, monkeypatch):
     assert len(prediction["point_bad_t"]) == 20
     assert len(prediction["point_bad_s"]) == 20
     assert len(prediction["point_density_inconsistent"]) == 20
+    assert np.allclose(prediction["nuisance_head_mean"], 0.0)
+    assert np.allclose(prediction["nuisance_head_std"], 1.0)
 
     final = writer.finalize(history=history, checkpoint_path=tmp_path / "checkpoint.pt")
     payload = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -1741,6 +1755,148 @@ def test_train_main_uses_test_root_with_augment(tmp_path, monkeypatch):
     assert payload["epochs"][0]["test"]["total"] == 0.5
 
 
+def test_train_main_saves_best_detection_checkpoint(tmp_path, monkeypatch):
+    from outlierdetect import cli
+    from outlierdetect.training.synthetic import degrade_highres_profile
+
+    synthetic_examples = [
+        degrade_highres_profile(
+            np.linspace(0, 500, 60),
+            5.0 - 3.0 * np.exp(-np.linspace(0, 500, 60) / 160.0),
+            34.1 + 0.4 * (1.0 - np.exp(-np.linspace(0, 500, 60) / 200.0)),
+            rng=np.random.default_rng(11),
+            profile_id="best_checkpoint_train_1",
+        ),
+        degrade_highres_profile(
+            np.linspace(0, 500, 60),
+            4.8 - 2.8 * np.exp(-np.linspace(0, 500, 60) / 150.0),
+            34.05 + 0.35 * (1.0 - np.exp(-np.linspace(0, 500, 60) / 190.0)),
+            rng=np.random.default_rng(12),
+            profile_id="best_checkpoint_train_2",
+        ),
+    ]
+
+    saved_checkpoints: dict[str, dict[str, object]] = {}
+
+    def fake_build_argo_synthetic_examples(*args, **kwargs):
+        return synthetic_examples
+
+    def fake_fit_model(
+        model,
+        train_loader,
+        val_loader=None,
+        *,
+        eval_label="val",
+        device="cpu",
+        weights=None,
+        grad_clip=1.0,
+        epochs=1,
+        optimizer=None,
+        learning_rate=1e-3,
+        epoch_callback=None,
+        progress=True,
+        normalization_accumulator=None,
+        normalization_callback=None,
+        **kwargs,
+    ):
+        history: list[dict[str, float]] = []
+        epoch_payloads = [
+            (1, 1.2, 0.6, 0.4, 1.2),
+            (2, 0.9, 0.25, 0.2, 1.0),
+            (3, 0.8, 0.30, 0.18, 0.65),
+        ]
+        for epoch, train_total, val_profile_qc, val_point_qc, val_nuisance in epoch_payloads:
+            history.append({"train_total": float(train_total), "epoch": float(epoch)})
+            history.append(
+                {
+                    "val_total": float(train_total - 0.1),
+                    "val_profile_qc": float(val_profile_qc),
+                    "val_point_qc": float(val_point_qc),
+                    "val_nuisance": float(val_nuisance),
+                    "epoch": float(epoch),
+                }
+            )
+            if epoch_callback is not None:
+                epoch_callback(epoch, model, history)
+        return history
+
+    def fake_save_checkpoint(path, model, metadata=None):
+        saved_checkpoints[str(path)] = {
+            "path": str(path),
+            "metadata": metadata,
+        }
+
+    def fake_plot(self, path, **kwargs):
+        path.write_text("plot", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "build_argo_synthetic_examples", fake_build_argo_synthetic_examples)
+    monkeypatch.setattr(cli, "fit_model", fake_fit_model)
+    monkeypatch.setattr(cli, "save_checkpoint", fake_save_checkpoint)
+    monkeypatch.setattr("outlierdetect.training.artifacts.TrainingRunWriter._save_reconstruction_plot", fake_plot)
+
+    output_path = tmp_path / "checkpoint.pt"
+    cli.train_main(
+        [
+            "--train-root",
+            str(tmp_path / "train"),
+            "--output",
+            str(output_path),
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--epochs",
+            "3",
+            "--batch-size",
+            "1",
+            "--val-fraction",
+            "0.5",
+            "--epoch-plot-count",
+            "1",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    detection_path = str(cli._checkpoint_variant_path(output_path, "best_detection"))
+    nuisance_path = str(cli._checkpoint_variant_path(output_path, "best_nuisance"))
+    assert str(output_path) in saved_checkpoints
+    assert detection_path in saved_checkpoints
+    assert nuisance_path in saved_checkpoints
+
+    detection = saved_checkpoints[detection_path]
+    detection_selection = detection["metadata"]["checkpoint_selection"]
+    assert detection["metadata"]["checkpoint_role"] == "best_detection"
+    assert detection_selection["monitor"] == "val_profile_qc + val_point_qc"
+    assert detection_selection["best_epoch"] == 2
+    assert np.isclose(detection_selection["best_score"], 0.45)
+
+    nuisance = saved_checkpoints[nuisance_path]
+    nuisance_selection = nuisance["metadata"]["checkpoint_selection"]
+    assert nuisance["metadata"]["checkpoint_role"] == "best_nuisance"
+    assert nuisance_selection["monitor"] == "val_nuisance"
+    assert nuisance_selection["best_epoch"] == 3
+    assert np.isclose(nuisance_selection["best_score"], 0.65)
+
+    final = saved_checkpoints[str(output_path)]
+    assert final["path"] == str(output_path)
+    assert final["metadata"]["checkpoint_role"] == "final"
+    related = final["metadata"]["related_checkpoints"]
+    assert related["best_detection"]["path"] == detection_path
+    assert related["best_detection"]["epoch"] == 2
+    assert np.isclose(related["best_detection"]["score"], 0.45)
+    assert related["best_nuisance"]["path"] == nuisance_path
+    assert related["best_nuisance"]["epoch"] == 3
+    assert np.isclose(related["best_nuisance"]["score"], 0.65)
+
+    progress_files = list((tmp_path / "runs").rglob("progress.json"))
+    assert len(progress_files) == 1
+    payload = json.loads(progress_files[0].read_text(encoding="utf-8"))
+    assert payload["checkpoint_path"].endswith("checkpoint.pt")
+    assert payload["checkpoint_paths"]["final"] == str(output_path)
+    assert payload["checkpoint_paths"]["best_detection"] == detection_path
+    assert payload["checkpoint_paths"]["best_nuisance"] == nuisance_path
+    assert payload["epochs"][-1]["epoch"] == 3
+
+
 def test_predict_main_writes_probability_json(tmp_path, monkeypatch):
     from outlierdetect import cli
     from outlierdetect.argo import ArgoProfile
@@ -1831,6 +1987,8 @@ def test_predict_main_writes_probability_json(tmp_path, monkeypatch):
     assert len(payload["prediction_files"]) == 2
     assert len(payload["plot_files"]) == 2
     assert captured["good_qc_only"] is False
+    assert np.allclose(payload["selected_profiles"][0]["nuisance_head_mean"], 0.0)
+    assert np.allclose(payload["selected_profiles"][0]["nuisance_head_std"], 1.0)
 
     prediction_dir = progress_files[0].parent / "predictions"
     plot_dir = progress_files[0].parent / "plots" / "predict"
@@ -1844,6 +2002,8 @@ def test_predict_main_writes_probability_json(tmp_path, monkeypatch):
         assert len(prediction["point_bad_t"]) == 3
         assert len(prediction["point_bad_s"]) == 3
         assert len(prediction["point_density_inconsistent"]) == 3
+        assert np.allclose(prediction["nuisance_head_mean"], 0.0)
+        assert np.allclose(prediction["nuisance_head_std"], 1.0)
 
 
 def test_predict_main_can_apply_good_qc_only(tmp_path, monkeypatch):
